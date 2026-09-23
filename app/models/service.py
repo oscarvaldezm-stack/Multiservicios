@@ -77,6 +77,7 @@ class ServiceOrder(TimestampMixin, Base):
     )
     agreed_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    departed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))   # "en camino": se autoriza el cobro
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     work_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

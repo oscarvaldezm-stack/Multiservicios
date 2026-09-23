@@ -12,13 +12,16 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+from app.models.enums import PaymentStatus
 from app.payments.providers.base import (
     AccountPrefill,
     AccountStatusInfo,
+    AuthorizationRequest,
     Capabilities,
     OnboardingLink,
     PaymentProvider,
     ProviderError,
+    ProviderPayment,
     SavedCard,
     SetupIntentInfo,
 )
@@ -42,6 +45,11 @@ class FakePaymentProvider(PaymentProvider):
         self.setup_intents: list[str] = []
         self.calls: list[str] = []
         self.fail_next: ProviderError | None = None
+        self.intents: dict[str, dict] = {}
+        self._intent_by_payment: dict[uuid.UUID, str] = {}
+        self._card_owner: dict[str, str] = {}
+        self._fingerprints: dict[str, str] = {}
+        self.decline_next: str | None = None        # "card_declined", "insufficient_funds", "authentication_required"
 
     def _enter(self, op: str) -> None:
         self.calls.append(op)
@@ -104,11 +112,77 @@ class FakePaymentProvider(PaymentProvider):
         self.setup_intents.append(sid)
         return SetupIntentInfo(provider_id=sid, client_secret=f"{sid}_secret_{secrets.token_hex(12)}")
 
-    def add_card(self, provider_customer_id: str, brand: str = "visa", last4: str = "4242") -> None:
-        """Simula que la app confirmó el SetupIntent con el componente de Stripe."""
-        self.cards[provider_customer_id].append(SavedCard(provider_id=f"pm_fake{secrets.token_hex(6)}",
-                                                          brand=brand, last4=last4, exp_month=12, exp_year=2030))
+    def add_card(self, provider_customer_id: str, brand: str = "visa", last4: str = "4242") -> str:
+        """Simula que la app confirmó el SetupIntent con el componente de Stripe. Devuelve el id del método."""
+        pm = f"pm_fake{secrets.token_hex(6)}"
+        self.cards[provider_customer_id].append(SavedCard(provider_id=pm, brand=brand, last4=last4, exp_month=12,
+                                                          exp_year=2030))
+        self._card_owner[pm] = provider_customer_id
+        self._fingerprints[pm] = f"fp_{secrets.token_hex(6)}"  # cada tarjeta, su huella (las pruebas la fijan)
+        return pm
 
     def list_saved_cards(self, provider_customer_id: str) -> list[SavedCard]:
         self._enter("customers.payment_methods.list")
         return list(self.cards.get(provider_customer_id, []))
+
+    # ------------------------------------------------------------------ cobros (Fase 3)
+    def _view(self, pid: str) -> ProviderPayment:
+        i = self.intents[pid]
+        return ProviderPayment(provider_payment_id=pid, status=i["status"], amount_cents=i["amount"],
+                               amount_capturable_cents=i["amount"] if i["status"] == PaymentStatus.AUTHORIZED else 0,
+                               amount_received_cents=i["received"], failure_code=i["failure_code"],
+                               payment_method_fingerprint=i["fingerprint"], client_secret=i["client_secret"])
+
+    def authorize(self, req: AuthorizationRequest) -> ProviderPayment:
+        self._enter("payment_intents.create")
+        if req.payment_id in self._intent_by_payment:                  # idempotencia authorize:{pago}
+            return self._view(self._intent_by_payment[req.payment_id])
+        if self._card_owner.get(req.payment_method_id) != req.customer_id:
+            raise ProviderError("Método de pago inexistente", code="PAYMENT_PROVIDER_REJECTED")
+        dest = self.accounts.get(req.destination_account_id)
+        if dest is None or not dest.transfers_active:
+            raise ProviderError("La cuenta destino no puede recibir transferencias", code="PAYMENT_PROVIDER_REJECTED")
+        if not 0 <= req.application_fee_cents <= req.amount_cents:
+            raise ProviderError("Comisión inválida", code="PAYMENT_PROVIDER_REJECTED")
+        pid = f"pi_fake{secrets.token_hex(8)}"
+        decline, self.decline_next = self.decline_next, None
+        status = PaymentStatus.AUTHORIZED
+        if decline == "authentication_required":
+            status = PaymentStatus.REQUIRES_ACTION
+        elif decline:
+            status = PaymentStatus.FAILED
+        self.intents[pid] = {"status": status, "amount": req.amount_cents, "received": 0, "request": req,
+                             "failure_code": decline, "fingerprint": self._fingerprints[req.payment_method_id],
+                             "client_secret": f"{pid}_secret_{secrets.token_hex(8)}", "captures": 0}
+        self._intent_by_payment[req.payment_id] = pid
+        return self._view(pid)
+
+    def complete_authentication(self, provider_payment_id: str) -> None:
+        """Simula que el cliente completó 3D Secure en la app."""
+        self.intents[provider_payment_id].update(status=PaymentStatus.AUTHORIZED, failure_code=None)
+
+    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int) -> ProviderPayment:
+        self._enter("payment_intents.capture")
+        i = self.intents[provider_payment_id]
+        if i["status"] == PaymentStatus.PAID:                           # idempotencia capture:{pago}
+            return self._view(provider_payment_id)
+        if i["status"] != PaymentStatus.AUTHORIZED or amount_cents > i["amount"]:
+            raise ProviderError("No se puede capturar", code="PAYMENT_PROVIDER_REJECTED")
+        i.update(status=PaymentStatus.PAID, received=amount_cents, captures=i["captures"] + 1)
+        return self._view(provider_payment_id)
+
+    def cancel_authorization(self, provider_payment_id: str, payment_id: uuid.UUID) -> ProviderPayment:
+        self._enter("payment_intents.cancel")
+        i = self.intents[provider_payment_id]
+        if i["status"] == PaymentStatus.PAID:
+            raise ProviderError("Un cobro capturado se reembolsa, no se anula", code="PAYMENT_PROVIDER_REJECTED")
+        i["status"] = PaymentStatus.CANCELLED
+        return self._view(provider_payment_id)
+
+    def get_payment(self, provider_payment_id: str) -> ProviderPayment:
+        self._enter("payment_intents.retrieve")
+        return self._view(provider_payment_id)
+
+    def set_intent(self, provider_payment_id: str, **changes) -> None:
+        """Simula cambios en el proveedor que la app no provocó (p. ej. la autorización venció)."""
+        self.intents[provider_payment_id].update(changes)

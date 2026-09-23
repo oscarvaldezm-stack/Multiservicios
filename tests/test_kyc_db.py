@@ -177,8 +177,19 @@ def test_reserva_directa_a_tecnico_no_aprobado_se_rechaza(tech_id, db):
     assert "KYC_NOT_APPROVED" in str(exc.value.orig)
 
 
+def _enabled_payment_account(db, tech_id) -> None:
+    """Regla crítica ampliada (pagos, Fase 3): recibir órdenes exige también una cuenta de pagos habilitada."""
+    db.execute(text("INSERT INTO technician_payment_accounts (id, technician_id, provider) "
+                    "VALUES (gen_random_uuid(), :t, 'stripe')"), {"t": tech_id})
+    db.execute(text("UPDATE technician_payment_accounts SET status = 'ONBOARDING', provider_account_id = 'acct_t' "
+                    "WHERE technician_id = :t"), {"t": tech_id})
+    db.execute(text("UPDATE technician_payment_accounts SET status = 'ENABLED' WHERE technician_id = :t"),
+               {"t": tech_id})
+
+
 def test_tecnico_aprobado_si_recibe_y_al_suspenderlo_se_bloquea(tech_id, reviewer, supervisor, db):
     drive_to(db, tech_id, S.APPROVED, reviewer, supervisor)
+    _enabled_payment_account(db, tech_id)
     first = _new_request(db)
     db.execute(text(_ASSIGN), {"t": tech_id, "id": first.id})
     db.execute(text("UPDATE technician_profiles SET is_available = true WHERE user_id = :t"), {"t": tech_id})

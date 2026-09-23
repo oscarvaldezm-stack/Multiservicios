@@ -6,7 +6,10 @@ Seguridad:
 - La clave secreta solo existe aquí (StripeClient) y nunca se registra.
 - Versión de la API fijada (STRIPE_API_VERSION): un cambio de Stripe no altera el comportamiento.
 - Idempotency-Key determinista en toda creación que no debe duplicarse
-  (account-create:{técnico}, customer-create:{usuario}): un reintento de red no crea dos cuentas.
+  (account-create:{técnico}, customer-create:{usuario}, authorize/capture/cancel:{pago}):
+  un reintento de red no crea dos cuentas, dos cobros ni dos capturas.
+- Cargos de destino: la plataforma crea el cobro con transfer_data[destination] y
+  application_fee_amount; con la captura, Stripe transfiere al técnico una sola vez.
 - Los errores se traducen a códigos propios; el mensaje de Stripe no se devuelve al cliente
   ni se registra completo (puede contener datos personales).
 """
@@ -20,13 +23,16 @@ from typing import Any
 import stripe
 
 from app.core.config import Settings, get_settings
+from app.models.enums import PaymentStatus
 from app.payments.providers.base import (
     AccountPrefill,
     AccountStatusInfo,
+    AuthorizationRequest,
     Capabilities,
     OnboardingLink,
     PaymentProvider,
     ProviderError,
+    ProviderPayment,
     SavedCard,
     SetupIntentInfo,
 )
@@ -62,6 +68,14 @@ class StripePaymentProvider(PaymentProvider):
     def _call(self, op: str, fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
+        except stripe.StripeError as exc:
+            self._translate(op, exc)
+
+    @staticmethod
+    def _translate(op: str, exc: Exception) -> None:
+        """Lanza el ProviderError equivalente, sin el mensaje de Stripe."""
+        try:
+            raise exc
         except (stripe.RateLimitError, stripe.APIConnectionError) as exc:
             log.warning("Stripe no disponible en %s: %s", op, type(exc).__name__)
             raise ProviderError("El proveedor de pagos no responde; intenta de nuevo",
@@ -162,3 +176,78 @@ class StripePaymentProvider(PaymentProvider):
                                    last4=str(_get(card, "last4") or ""), exp_month=int(_get(card, "exp_month") or 0),
                                    exp_year=int(_get(card, "exp_year") or 0)))
         return cards
+
+    # ------------------------------------------------------------------ cobros (Fase 3)
+    _STATUS = {
+        "requires_payment_method": PaymentStatus.PENDING,
+        "requires_confirmation": PaymentStatus.PENDING,
+        "requires_action": PaymentStatus.REQUIRES_ACTION,
+        "processing": PaymentStatus.PROCESSING,
+        "requires_capture": PaymentStatus.AUTHORIZED,
+        "succeeded": PaymentStatus.PAID,
+        "canceled": PaymentStatus.CANCELLED,
+    }
+
+    @classmethod
+    def _to_payment(cls, pi: Any, *, force_status: PaymentStatus | None = None) -> ProviderPayment:
+        error = _get(pi, "last_payment_error")
+        status = force_status or cls._STATUS.get(_get(pi, "status"), PaymentStatus.PENDING)
+        if status == PaymentStatus.PENDING and error is not None:
+            status = PaymentStatus.FAILED            # el intento se rechazó y no hay otro método
+        charge = _get(pi, "latest_charge")
+        fingerprint = _get(charge, "payment_method_details", "card", "fingerprint") if not isinstance(charge, str) \
+            else None
+        return ProviderPayment(
+            provider_payment_id=_get(pi, "id"), status=status, amount_cents=int(_get(pi, "amount") or 0),
+            amount_capturable_cents=int(_get(pi, "amount_capturable") or 0),
+            amount_received_cents=int(_get(pi, "amount_received") or 0),
+            failure_code=(_get(error, "decline_code") or _get(error, "code")) if error is not None else None,
+            payment_method_fingerprint=fingerprint, client_secret=_get(pi, "client_secret"))
+
+    def authorize(self, req: AuthorizationRequest) -> ProviderPayment:
+        params = {
+            "amount": req.amount_cents,
+            "currency": req.currency.lower(),
+            "customer": req.customer_id,
+            "payment_method": req.payment_method_id,
+            "payment_method_types": ["card"],
+            "capture_method": "manual",              # D7: se reserva al salir el técnico, se cobra al aprobar
+            "confirm": True,
+            "off_session": True,                     # tarjeta guardada, sin el cliente presente
+            "transfer_data": {"destination": req.destination_account_id},
+            "application_fee_amount": req.application_fee_cents,
+            "metadata": {"payment_id": str(req.payment_id), "order_id": str(req.order_id)},
+            "expand": ["latest_charge"],
+        }
+        try:
+            pi = self._c.v1.payment_intents.create(params=params,
+                                                   options={"idempotency_key": f"authorize:{req.payment_id}"})
+        except stripe.CardError as exc:
+            # Un rechazo no es un error del sistema: el cliente cambia de tarjeta o se autentica.
+            err = getattr(exc, "error", None)
+            pi = getattr(err, "payment_intent", None)
+            code = getattr(err, "decline_code", None) or getattr(exc, "code", None) or "card_declined"
+            if code == "authentication_required" and pi is not None:
+                return self._to_payment(pi, force_status=PaymentStatus.REQUIRES_ACTION)
+            return ProviderPayment(provider_payment_id=_get(pi, "id"), status=PaymentStatus.FAILED,
+                                   amount_cents=req.amount_cents, failure_code=str(code)[:60])
+        except stripe.StripeError as exc:
+            self._translate("payment_intents.create", exc)
+        return self._to_payment(pi)
+
+    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int) -> ProviderPayment:
+        pi = self._call("payment_intents.capture", self._c.v1.payment_intents.capture, provider_payment_id,
+                        params={"amount_to_capture": amount_cents, "expand": ["latest_charge"]},
+                        options={"idempotency_key": f"capture:{payment_id}"})
+        return self._to_payment(pi)
+
+    def cancel_authorization(self, provider_payment_id: str, payment_id: uuid.UUID) -> ProviderPayment:
+        pi = self._call("payment_intents.cancel", self._c.v1.payment_intents.cancel, provider_payment_id,
+                        params={"cancellation_reason": "requested_by_customer"},
+                        options={"idempotency_key": f"cancel:{payment_id}"})
+        return self._to_payment(pi)
+
+    def get_payment(self, provider_payment_id: str) -> ProviderPayment:
+        pi = self._call("payment_intents.retrieve", self._c.v1.payment_intents.retrieve, provider_payment_id,
+                        params={"expand": ["latest_charge"]})
+        return self._to_payment(pi)

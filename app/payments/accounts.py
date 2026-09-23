@@ -195,6 +195,7 @@ def sync_account(db: Session, account: TechnicianPaymentAccount, provider: Payme
         return account
     info = provider.get_account_status(account.provider_account_id)
     before = account.status
+    was_eligible = account.can_receive_payments
     target = derive_status(before, info)
     if (before, target) in ALLOWED_ACCOUNT_TRANSITIONS or before == target:
         _move(account, target)
@@ -228,8 +229,17 @@ def sync_account(db: Session, account: TechnicianPaymentAccount, provider: Payme
         db.add(OutboxEvent(event_type=f"payment_account.{account.status.value.lower()}",
                            aggregate_type="technician_payment_account", aggregate_id=account.id,
                            recipient_user_id=account.technician_id, payload={"status": account.status.value}))
+    if was_eligible and not account.can_receive_payments:
+        _release_orders(db, account.technician_id)
     db.flush()
     return account
+
+
+def _release_orders(db: Session, technician_id: uuid.UUID) -> None:
+    """Sin cuenta para cobrar, sus órdenes no iniciadas vuelven a la bolsa (y se anulan sus reservas)."""
+    from app.orders.service import release_technician_orders
+
+    release_technician_orders(db, technician_id, "PAYMENT_ACCOUNT_NOT_ENABLED")
 
 
 # =============================================================================
@@ -272,6 +282,8 @@ def resolve_name_review(db: Session, actor: Actor, account_id: uuid.UUID, *, app
         account.blocked_reason = "NAME_REJECTED"
     account.version += 1
     db.flush()
+    if not approve:
+        _release_orders(db, account.technician_id)
     write_audit(db, action="payment_account.name_review", actor=actor, technician_id=account.technician_id,
                 target_type="technician_payment_account", target_id=str(account.id),
                 reason_code="APPROVED" if approve else "REJECTED", reason_note=note, ctx=ctx)

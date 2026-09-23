@@ -8,6 +8,7 @@ from sqlalchemy import select, text
 
 from app.models import KycStatus, Payment, ServiceOrder, User
 from app.payments import service as payments
+from app.payments.providers import get_provider
 from app.payments.commission import to_cents
 from tests.conftest import API, auth, drive_to, login, register, verify_email
 
@@ -16,13 +17,54 @@ REVIEWS = f"{API}/reviews"
 
 
 def approved_tech(client, db, category, reviewer, supervisor, email: str = "tec@example.com", n: int = 4,
-                  device: str | None = None):
+                  device: str | None = None, payment_account: bool = True):
+    """Técnico con KYC APROBADO y (por defecto) cuenta de pagos habilitada: la regla crítica completa."""
     assert register(client, "technician", email, category_ids=[category.id]).status_code == 201
     uid = db.scalar(select(User.id).where(User.email == email))
     drive_to(db, uid, KycStatus.APPROVED, reviewer, supervisor, n=n)
     db.execute(text("UPDATE technician_profiles SET is_available = true WHERE user_id = :t"), {"t": uid})
     db.commit()
-    return uid, _headers(client, email, device)
+    headers = _headers(client, email, device)
+    if payment_account:
+        enable_payment_account(client, db, uid, headers)
+    return uid, headers
+
+
+def enable_payment_account(client, db, uid, headers) -> None:
+    """Alta en el proveedor falso + formulario completado + consulta: la cuenta queda ENABLED."""
+    from app.models import TechnicianPaymentAccount
+    assert client.post(f"{API}/technicians/me/payment-account", headers=headers, json={}).status_code == 201
+    acct = db.scalar(select(TechnicianPaymentAccount.provider_account_id)
+                     .where(TechnicianPaymentAccount.technician_id == uid))
+    get_provider().complete_onboarding(acct)
+    r = client.post(f"{API}/technicians/me/payment-account/refresh", headers=headers, json={})
+    assert r.json()["status"] == "ENABLED", r.text
+
+
+def choose_card(client, db, ch, order_id, *, fingerprint: str | None = None, last4: str = "4242") -> str:
+    """El cliente guarda una tarjeta (simulada en el proveedor) y la elige para la orden."""
+    from app.models import PaymentCustomer
+    order = db.get(ServiceOrder, uuid.UUID(str(order_id)))
+    db.expire_all()
+    assert client.post(f"{API}/clients/me/payment-methods/setup-intent", headers=ch, json={}).status_code == 201
+    customer = db.scalar(select(PaymentCustomer.provider_customer_id)
+                         .where(PaymentCustomer.user_id == order.client_id))
+    fake = get_provider()
+    pm = fake.add_card(customer, last4=last4)
+    if fingerprint:
+        fake._fingerprints[pm] = fingerprint
+    r = client.post(f"{ORDERS}/{order_id}/payment-method", headers=ch | {"Idempotency-Key": uuid.uuid4().hex},
+                    json={"payment_method_id": pm})
+    assert r.status_code == 200, r.text
+    return pm
+
+
+def capture_due(db) -> int:
+    """Lo que hace el worker cada minuto: capturar lo aprobado."""
+    done = payments.capture_due(db)
+    db.commit()
+    db.expire_all()
+    return done
 
 
 def new_client(client, db, email: str = "cliente@example.com", *, verified: bool = True, device: str | None = None,
@@ -90,11 +132,11 @@ def run_order(client, db, ch, th, category, *, until: str = "READY_FOR_REVIEW", 
         ("ACCEPTED", lambda: client.post(f"{ORDERS}/{oid}/accept", headers=th, json={"agreed_price": price})),
         ("SCHEDULED", lambda: client.post(f"{ORDERS}/{oid}/schedule", headers=th, json={
             "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()})),
-        ("AUTHORIZED", lambda: webhook(db, oid, "authorized", fingerprint=fingerprint)),
+        ("AUTHORIZED", lambda: _depart(client, db, ch, th, oid, fingerprint)),
         ("IN_PROGRESS", lambda: client.post(f"{ORDERS}/{oid}/start", headers=th)),
         ("AWAITING_APPROVAL", lambda: client.post(f"{ORDERS}/{oid}/finish", headers=th)),
         ("COMPLETED", lambda: client.post(f"{ORDERS}/{oid}/approve", headers=ch, json={})),
-        ("READY_FOR_REVIEW", lambda: webhook(db, oid, "captured")),
+        ("READY_FOR_REVIEW", lambda: capture_due(db) and None),
     ]
     for name, step in steps:
         r = step()
@@ -103,6 +145,12 @@ def run_order(client, db, ch, th, category, *, until: str = "READY_FOR_REVIEW", 
         if name == until:
             break
     return oid
+
+
+def _depart(client, db, ch, th, oid, fingerprint):
+    choose_card(client, db, ch, oid, fingerprint=fingerprint)
+    r = client.post(f"{ORDERS}/{oid}/depart", headers=th)
+    assert r.status_code == 200 and r.json()["can_start"], r.text
 
 
 def order_status(db, oid) -> str:

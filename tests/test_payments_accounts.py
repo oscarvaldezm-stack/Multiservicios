@@ -39,7 +39,7 @@ def fake():
 
 @pytest.fixture
 def tech(client, db, category, reviewer, supervisor):
-    tid, th = approved_tech(client, db, category, reviewer, supervisor)
+    tid, th = approved_tech(client, db, category, reviewer, supervisor, payment_account=False)
     return tid, th
 
 

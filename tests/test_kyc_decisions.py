@@ -307,7 +307,8 @@ def test_programador_de_trabajos_corre_todo(db):
     from worker.jobs import run_once
     result = run_once()
     assert set(result) == {"kyc.release_stale_claims", "kyc.expire_approvals", "orders.auto_approve",
-                           "orders.expire_requests"}
+                           "orders.expire_requests", "payments.enforce_capture_deadline",
+                           "payments.capture_due", "payments.purge_idempotency_keys"}
     assert all(v == 0 for v in result.values())
 
 

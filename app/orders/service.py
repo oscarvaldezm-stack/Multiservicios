@@ -7,8 +7,10 @@ Reglas de seguridad:
 - Un técnico solo acepta si su KYC está APROBADO (dependencia VerifiedTechnician + FOR SHARE,
   y un trigger en la base lo repite), si está disponible y si ofrece esa categoría.
 - Aceptar usa FOR UPDATE sobre la orden: dos técnicos no pueden ganar la misma orden.
-- El pago lo confirma solo el proveedor (app/payments/service.py); iniciar el trabajo exige
-  el pago autorizado.
+- Regla crítica ampliada: aceptar, agendar o recibir una reserva directa exige KYC APROBADO
+  y cuenta de pagos habilitada (también lo repite un trigger).
+- El pago lo confirma solo el proveedor (app/payments/service.py). El cobro se autoriza cuando
+  el técnico marca "en camino" (D7) e iniciar el trabajo exige el pago autorizado.
 """
 from __future__ import annotations
 
@@ -33,7 +35,9 @@ from app.models import (
     PaymentStatus,
     Review,
     ServiceCategory,
+    PaymentAccountStatus,
     ServiceOrder,
+    TechnicianPaymentAccount,
     TechnicianProfile,
     TechnicianService,
     User,
@@ -53,6 +57,14 @@ def _now() -> datetime:
 
 def _actor(user: User) -> Actor:
     return Actor.of(user)
+
+
+def _require_payment_account(db: Session, technician_id: uuid.UUID) -> None:
+    from app.payments.accounts import can_receive_payments
+
+    if not can_receive_payments(db, technician_id, get_settings().PAYMENT_PROVIDER):
+        raise DomainError("Tu cuenta de pagos no está habilitada; complétala para recibir servicios",
+                          code="PAYMENT_ACCOUNT_NOT_ENABLED", http_status=403)
 
 
 def get_for_user(db: Session, user: User, order_id: uuid.UUID, *, lock: bool = False) -> ServiceOrder:
@@ -84,9 +96,11 @@ def create(db: Session, client: User, *, category_id: int, title: str, descripti
         # Reserva directa: el técnico debe existir, estar aprobado, disponible y ofrecer la categoría.
         # Respuesta genérica para no revelar el estado KYC de un tercero.
         offers = db.scalar(select(func.count()).select_from(TechnicianService).join(
-            TechnicianProfile, TechnicianProfile.user_id == TechnicianService.technician_id).where(
+            TechnicianProfile, TechnicianProfile.user_id == TechnicianService.technician_id).join(
+            TechnicianPaymentAccount, TechnicianPaymentAccount.technician_id == TechnicianService.technician_id).where(
             TechnicianService.technician_id == requested_technician_id, TechnicianService.category_id == category_id,
-            TechnicianProfile.is_available.is_(True)))
+            TechnicianProfile.is_available.is_(True), TechnicianPaymentAccount.status == PaymentAccountStatus.ENABLED,
+            TechnicianPaymentAccount.blocked_reason.is_(None)))
         if not offers:
             raise DomainError("Ese técnico no está disponible para esta categoría",
                               code="ORDER_TECHNICIAN_UNAVAILABLE", http_status=409)
@@ -160,6 +174,7 @@ def accept(db: Session, technician: User, order_id: uuid.UUID, agreed_price: Dec
     profile = db.get(TechnicianProfile, technician.id)
     if profile is None or not profile.is_available:
         raise OrderError("Márcate disponible para aceptar servicios", code="TECHNICIAN_NOT_AVAILABLE")
+    _require_payment_account(db, technician.id)
     s = get_settings()
     price_cents = to_cents(agreed_price)
     if not s.PAYMENT_MIN_SERVICE_CENTS <= price_cents <= s.PAYMENT_MAX_SERVICE_CENTS:
@@ -182,6 +197,7 @@ def accept(db: Session, technician: User, order_id: uuid.UUID, agreed_price: Dec
 def schedule(db: Session, technician: User, order_id: uuid.UUID, scheduled_at: datetime,
              ctx: RequestContext | None) -> ServiceOrder:
     order = get_for_user(db, technician, order_id, lock=True)
+    _require_payment_account(db, technician.id)
     if scheduled_at <= _now():
         raise DomainError("La fecha debe ser futura", code="ORDER_SCHEDULE_IN_PAST", http_status=422)
     order.scheduled_at = scheduled_at
@@ -197,6 +213,26 @@ def withdraw(db: Session, technician: User, order_id: uuid.UUID, reason: str | N
     transition(db, order, O.REQUESTED, _actor(technician), reason_code="TECHNICIAN_WITHDREW", note=reason, ctx=ctx)
     _refresh_reputation(db, technician.id)
     return order
+
+
+def depart(db: Session, technician: User, order_id: uuid.UUID, ctx: RequestContext | None):
+    """
+    "En camino" (D7): se autoriza el cobro en la tarjeta que eligió el cliente. Si el banco lo
+    rechaza, el técnico NO debe salir: la orden sigue agendada y el cliente elige otra tarjeta.
+    Repetirlo con el pago ya autorizado no vuelve a cobrar.
+    """
+    order = get_for_user(db, technician, order_id, lock=True)
+    if order.status != O.SCHEDULED:
+        raise OrderError("Solo se sale a un servicio agendado", code="ORDER_NOT_SCHEDULED",
+                         extra={"status": order.status.value})
+    payment = payments.authorize_for_departure(db, order)
+    if payment.status == PaymentStatus.AUTHORIZED and order.departed_at is None:
+        order.departed_at = _now()
+        order.version += 1
+        db.add(OutboxEvent(event_type="order.technician_on_the_way", aggregate_type="service_order",
+                           aggregate_id=order.id, recipient_user_id=order.client_id, payload={}))
+    db.flush()
+    return order, payment
 
 
 def start(db: Session, technician: User, order_id: uuid.UUID, ctx: RequestContext | None) -> ServiceOrder:
@@ -345,6 +381,17 @@ def auto_approve(db: Session, now: datetime | None = None) -> int:
             _after_completed(db, order)
             _refresh_reputation(db, order.technician_id)
     return len(ids)
+
+
+def approve_before_authorization_expires(db: Session, order_id: uuid.UUID) -> bool:
+    """La autorización vence en menos de 24 h y el cliente no respondió: se aprueba sola para poder cobrar."""
+    order = lock_order(db, order_id)
+    if order is None or order.status != O.AWAITING_APPROVAL:
+        return False
+    transition(db, order, O.COMPLETED, Actor.system(), reason_code="AUTO_APPROVED_AUTH_EXPIRING")
+    _after_completed(db, order)
+    _refresh_reputation(db, order.technician_id)
+    return True
 
 
 def expire_requests(db: Session, now: datetime | None = None) -> int:

@@ -1,6 +1,6 @@
 # Multiservicios API: Backend
 
-Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta).
+Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa).
 
 FastAPI · SQLAlchemy 2.0 · PostgreSQL · OAuth2 Password Flow + JWT · Passlib/bcrypt
 
@@ -42,6 +42,7 @@ app/
 │   ├── ledger.py        # Libro de partida doble (cada grupo de asientos suma cero)
 │   ├── accounts.py      # Cuenta de pagos del técnico: alta, formulario de Stripe, estado, bloqueos
 │   ├── customers.py     # Cliente en Stripe y guardado de tarjeta (SetupIntent)
+│   ├── idempotency.py   # Encabezado Idempotency-Key de los POST de pagos
 │   └── providers/       # Contrato PaymentProvider, adaptador de Stripe y proveedor falso
 ├── reviews/             # Calificaciones: servicio, antifraude, reputación, firma de integridad, filtros de texto
 ├── audit/writer.py      # Auditoría con cadena de hashes y verify_chain()
@@ -60,16 +61,16 @@ app/
 │       ├── reviews.py         # /reviews, /technicians/{id}/reviews, /admin/reviews
 │       └── payments.py        # /technicians/me/payment-account, /clients/me/payment-methods
 └── main.py              # App, CORS, TrustedHost, headers de seguridad
-migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico
+migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico, 0008 autorización y regla crítica ampliada
 scripts/
 ├── init_db.py           # Solo desarrollo: aplica migraciones y carga categorías
 ├── create_admin.py      # Único camino para crear administradores
 ├── load_sepomex.py      # Carga el catálogo oficial de códigos postales
 └── rotate_keys.py       # Estado, activación, re-envoltura, revocación y re-key de llaves
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
-worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas
+worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas, captura de pagos
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
-tests/                   # 563 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+tests/                   # 598 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
@@ -792,7 +793,84 @@ La app usa el `client_secret` con el componente oficial de Stripe (PaymentSheet 
 
 ### 12.6 Limitaciones conocidas
 
-- **Regla crítica en órdenes:** `accounts.can_receive_payments()` ya existe, pero exigir "KYC aprobado **y** cuenta habilitada" para aceptar órdenes y autorizar cobros llega en la Fase 3, junto con la autorización.
+- **Regla crítica en órdenes:** hecha en la Fase 3 (sección 13.3).
 - **Actualización automática:** el estado de la cuenta se actualiza al consultar (`refresh`); el webhook `account.updated` que lo hará solo llega en la Fase 4.
 - La idempotencia de Stripe dura 24 h: un reintento de alta después de ese plazo, con la fila perdida, podría crear otra cuenta en Stripe (la base sigue teniendo una sola).
 - El límite de SetupIntents por cliente lo da Nginx (por IP); no hay un conteo por usuario.
+
+---
+
+## 13. Pagos, Fase 3: autorización, captura, cargos de destino y regla crítica
+
+### 13.1 Flujo del dinero
+
+```
+SCHEDULED ─ cliente: POST /orders/{id}/payment-method  (tarjeta guardada; Idempotency-Key)
+    │
+    ├─ técnico: POST /orders/{id}/depart  ("en camino", D7)
+    │     └─► Stripe: PaymentIntent capture_method=manual, off_session, confirm,
+    │           transfer_data[destination]=cuenta del técnico, application_fee_amount=comisión+IVA+retenciones
+    │        ├─ requires_capture → AUTHORIZED: el técnico sale y puede iniciar
+    │        ├─ rechazo          → FAILED: NO sale; la orden sigue agendada, pago nuevo, el cliente elige otra tarjeta
+    │        └─ 3D Secure        → REQUIRES_ACTION: el cliente se autentica en la app y consulta (refresh)
+    │
+IN_PROGRESS → AWAITING_APPROVAL → COMPLETED (el cliente aprueba o pasan 72 h, D5)
+    │
+    └─ worker: payments.capture_due → Stripe capture (capture:{pago}) → PAID → READY_FOR_REVIEW
+         Stripe transfiere al técnico en la captura: una sola vez, sin transferencias manuales.
+```
+
+La autorización se hace al salir, no al agendar, porque vence (unos 4 días y 18 horas con tarjeta guardada) y un servicio puede agendarse con semanas de anticipación. **Aprobar no depende de Stripe**: la orden queda `COMPLETED` y el worker captura; si Stripe no responde, se reintenta en la siguiente vuelta.
+
+### 13.2 Endpoints nuevos
+
+| Método y ruta | Quién | Respuestas |
+|---|---|---|
+| `POST /api/v1/orders/{id}/payment-method` | Cliente dueño | 200 con la vista del pago; `Idempotency-Key` obligatorio (422 `IDEMPOTENCY_KEY_REQUIRED`); la misma llave repite la respuesta (`Idempotent-Replayed: true`) y con otro cuerpo da 422 `IDEMPOTENCY_KEY_REUSED`; 422 `PAYMENT_METHOD_NOT_FOUND` si la tarjeta no es suya; 409 `PAYMENT_METHOD_LOCKED` si el cobro ya se procesó; 404 si la orden es ajena |
+| `POST /api/v1/orders/{id}/depart` | Técnico asignado, KYC aprobado | 200 `{payment_status, can_start, failure_code}`; 409 `ORDER_PAYMENT_METHOD_MISSING` (y aviso al cliente), `PAYMENT_REQUIRES_ACTION`, `ORDER_NOT_SCHEDULED`; 403 `PAYMENT_ACCOUNT_NOT_ENABLED`; repetirlo no vuelve a cobrar |
+| `GET /api/v1/orders/{id}/payment` | Cliente dueño o técnico asignado | El cliente ve total, precio, IVA, descuento y (solo en `REQUIRES_ACTION`) el `client_secret` para 3D Secure. El técnico ve comisión, retenciones y lo que recibe. Nadie más: 404 |
+| `POST /api/v1/orders/{id}/payment/refresh` | Cliente dueño | Consulta el cobro en Stripe y aplica su estado; nunca recibe un estado |
+
+El body de `payment-method` solo acepta `payment_method_id` (`extra="forbid"`): ningún monto, comisión ni cuenta viene de la app.
+
+### 13.3 Regla crítica ampliada
+
+Aceptar, agendar o recibir una reserva directa exige **KYC `APPROVED` y cuenta de pagos `ENABLED` sin bloqueo**. Se valida en tres capas: la ruta (`VerifiedTechnician`), el servicio (`PAYMENT_ACCOUNT_NOT_ENABLED`, 403) y el trigger `order_technician_guard` de la migración 0008, que la repite aunque se escriba por SQL directo. "En camino" vuelve a verificar la cuenta antes de autorizar. Iniciar no la exige, porque el cobro ya quedó autorizado con su cuenta destino.
+
+Si la cuenta deja de poder cobrar (Stripe la restringe, se detecta un nombre distinto o un supervisor lo rechaza), el técnico **suelta en ese momento** sus órdenes no iniciadas: vuelven a la bolsa y sus reservas se anulan en Stripe. La suspensión o el vencimiento del KYC ya lo hacían.
+
+### 13.4 Idempotencia en tres niveles
+
+| Nivel | Cómo |
+|---|---|
+| Petición de la app | `Idempotency-Key` guardada con el hash del cuerpo y la respuesta, en la misma transacción que la operación (`app/payments/idempotency.py`); vence a las 24 h |
+| Nuestra API hacia Stripe | `authorize:{pago}`, `capture:{pago}`, `cancel:{pago}`: un reintento de red no crea otro cobro ni otra captura |
+| Base de datos | Un solo pago `SERVICE` activo por orden, `FOR UPDATE` sobre orden y pago, `SKIP LOCKED` en el worker |
+
+### 13.5 Vencimiento de la autorización y worker
+
+`python -m worker.jobs --loop --every 60` (recomendado cada minuto por la captura):
+
+| Trabajo | Qué hace |
+|---|---|
+| `orders.auto_approve` | Aprobación automática a las 72 h (D5) |
+| `payments.enforce_capture_deadline` | Si faltan menos de 24 h para que venza la autorización y el cliente no ha respondido, aprueba la orden (`AUTO_APPROVED_AUTH_EXPIRING`) para poder cobrar. Si el trabajo sigue en curso o hay una disputa, **no cobra**: alerta una vez a finanzas (`payment.authorization_expiring`), porque la decisión D4 sigue pendiente |
+| `payments.capture_due` | Captura los pagos autorizados de órdenes `COMPLETED` |
+| `payments.purge_idempotency_keys` | Borra las llaves vencidas |
+
+Si al capturar Stripe responde que la autorización ya no existe, se consulta el estado real y se alerta a finanzas (`payment.authorization_expired`). Si el técnico se retira, el cliente cancela o se liberan las órdenes, la reserva se anula en Stripe; si Stripe no responde, el pago queda `CANCELLED` localmente (nunca se capturará), la reserva se libera sola al vencer, y queda un evento `payment.void_requested` para reintento.
+
+### 13.6 Reconciliación
+
+Todo cambio de estado que viene de Stripe (respuesta a una llamada o, en la Fase 4, un webhook) pasa por `payments.apply_provider_state`. Si llega un estado "adelantado" (p. ej. `PAID` sin haber visto `AUTHORIZED`), recorre las transiciones válidas intermedias; uno viejo que retrocedería se registra y se ignora.
+
+### 13.7 Pruebas
+
+`tests/test_payments_flow.py` (regla crítica en la API y en el trigger, cuenta bloqueada o restringida, idempotencia, tarjeta ajena, vistas por rol, autorización con la división exacta hacia el técnico, rechazo y nueva tarjeta, 3D Secure, captura única por el worker, Stripe caído, autorización vencida, aprobación automática, salvaguarda de 24 h con y sin disputa, anulación con y sin Stripe, eventos adelantados y viejos) y las pruebas del adaptador en `tests/test_payments_provider.py` (parámetros exactos del PaymentIntent, rechazos, autenticación, captura, anulación y traducción de estados). Los helpers de prueba ahora recorren el flujo real: el técnico aprobado tiene cuenta habilitada, el cliente elige tarjeta, el técnico sale y el worker captura.
+
+### 13.8 Limitaciones y decisiones pendientes
+
+- **D4 (reclamo abierto cuando la autorización está por vencer):** hoy se alerta a finanzas y no se cobra. Si decides "capturar y reembolsar después", es un cambio pequeño en `enforce_capture_deadline`.
+- **Captura parcial** (cargo por visita, servicio parcial) y pagos `ADJUSTMENT`: Fase 5.
+- **Webhooks:** hasta la Fase 4, los cambios que ocurren en Stripe sin una llamada nuestra (p. ej. el cliente completa 3D Secure) se ven al consultar (`refresh`) o en la siguiente acción.
+- **OXXO y SPEI** quedan fuera (D3): solo tarjetas, que admiten captura manual.

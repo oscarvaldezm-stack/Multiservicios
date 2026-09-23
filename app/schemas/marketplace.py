@@ -130,6 +130,7 @@ class OrderOut(BaseModel):
     technician_id: uuid.UUID | None
     agreed_price: Decimal | None
     scheduled_at: datetime | None
+    departed_at: datetime | None = None
     accepted_at: datetime | None
     started_at: datetime | None
     work_finished_at: datetime | None

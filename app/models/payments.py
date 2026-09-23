@@ -145,6 +145,8 @@ class Payment(TimestampMixin, Base):
     captured_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     refunded_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     payment_method_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    # Tarjeta guardada que el cliente eligió para esta orden: solo el id del proveedor (pm_...).
+    provider_payment_method_id: Mapped[str | None] = mapped_column(String(120))
     failure_code: Mapped[str | None] = mapped_column(String(60))
     authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     capture_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # vence la autorización

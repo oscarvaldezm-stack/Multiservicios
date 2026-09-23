@@ -99,6 +99,12 @@ class _Res:
         return self.result
 
 
+PI_AUTHORIZED = {"id": "pi_1", "status": "requires_capture", "amount": 116000, "amount_capturable": 116000,
+                 "client_secret": "pi_1_secret_zz",
+                 "latest_charge": {"id": "ch_1", "payment_method_details": {"card": {"fingerprint": "fpX"}}}}
+PI_PAID = {"id": "pi_1", "status": "succeeded", "amount": 116000, "amount_received": 116000, "latest_charge": "ch_1"}
+
+
 def stub(**results):
     calls: list = []
 
@@ -114,6 +120,9 @@ def stub(**results):
                                   payment_methods=SimpleNamespace(list=res("pm.list", {"data": []}))),
         setup_intents=SimpleNamespace(create=res("setup_intents.create",
                                                  {"id": "seti_1", "client_secret": "seti_1_secret_abc"})),
+        payment_intents=SimpleNamespace(create=res("pi.create", PI_AUTHORIZED), capture=res("pi.capture", PI_PAID),
+                                        cancel=res("pi.cancel", {"id": "pi_1", "status": "canceled", "amount": 116000}),
+                                        retrieve=res("pi.retrieve", PI_AUTHORIZED)),
     )
     return SimpleNamespace(v1=v1), calls
 
@@ -207,3 +216,90 @@ def test_errores_de_stripe_se_traducen_sin_filtrar_datos(exc, code, status, retr
         StripePaymentProvider(settings(), client).create_connected_account(PREFILL)
     assert (err.value.code, err.value.http_status, err.value.retryable) == (code, status, retryable)
     assert SK_TEST not in str(err.value) and "Gloria" not in str(err.value)
+
+
+# ------------------------------------------------------------------ cobros (Fase 3)
+def _auth_request():
+    from app.payments.providers.base import AuthorizationRequest
+    return AuthorizationRequest(payment_id=uuid.UUID(int=9), order_id=uuid.UUID(int=10), amount_cents=116_000,
+                                currency="MXN", customer_id="cus_1", payment_method_id="pm_1",
+                                destination_account_id="acct_tec", application_fee_cents=27_900)
+
+
+def test_autorizacion_con_cargo_de_destino_y_captura_manual():
+    from app.models import PaymentStatus
+    client, calls = stub()
+    pp = StripePaymentProvider(settings(), client).authorize(_auth_request())
+    name, _, kw = calls[0]
+    p = kw["params"]
+    assert name == "pi.create"
+    assert (p["amount"], p["currency"], p["capture_method"], p["confirm"], p["off_session"]) == \
+        (116_000, "mxn", "manual", True, True)
+    assert p["transfer_data"] == {"destination": "acct_tec"} and p["application_fee_amount"] == 27_900
+    assert p["customer"] == "cus_1" and p["payment_method"] == "pm_1" and p["payment_method_types"] == ["card"]
+    assert kw["options"] == {"idempotency_key": f"authorize:{uuid.UUID(int=9)}"}
+    assert pp.status == PaymentStatus.AUTHORIZED and pp.payment_method_fingerprint == "fpX"
+    assert pp.amount_capturable_cents == 116_000
+
+
+def _card_error(code: str, pi: dict | None):
+    body = {"error": {"type": "card_error", "code": code, "decline_code": code}}
+    if pi:
+        body["error"]["payment_intent"] = pi
+    return stripe.CardError("Your card was declined.", None, code, json_body=body)
+
+
+def test_rechazo_de_tarjeta_no_es_excepcion():
+    from app.models import PaymentStatus
+    pi = {"id": "pi_2", "object": "payment_intent", "status": "requires_payment_method", "amount": 116000}
+    client, _ = stub(**{"pi.create": _card_error("insufficient_funds", pi)})
+    pp = StripePaymentProvider(settings(), client).authorize(_auth_request())
+    assert pp.status == PaymentStatus.FAILED and pp.failure_code == "insufficient_funds"
+    assert pp.provider_payment_id == "pi_2"
+
+
+def test_banco_pide_autenticacion():
+    from app.models import PaymentStatus
+    pi = {"id": "pi_3", "object": "payment_intent", "status": "requires_payment_method", "amount": 116000,
+          "client_secret": "pi_3_secret_q"}
+    client, _ = stub(**{"pi.create": _card_error("authentication_required", pi)})
+    pp = StripePaymentProvider(settings(), client).authorize(_auth_request())
+    assert pp.status == PaymentStatus.REQUIRES_ACTION and pp.client_secret == "pi_3_secret_q"
+    assert "pi_3_secret_q" not in repr(pp)
+
+
+def test_captura_anulacion_y_consulta():
+    from app.models import PaymentStatus
+    client, calls = stub()
+    p = StripePaymentProvider(settings(), client)
+    pay_id = uuid.UUID(int=9)
+    assert p.capture("pi_1", pay_id, 116_000).status == PaymentStatus.PAID
+    assert calls[-1][2]["params"]["amount_to_capture"] == 116_000
+    assert calls[-1][2]["options"] == {"idempotency_key": f"capture:{pay_id}"}
+    assert p.cancel_authorization("pi_1", pay_id).status == PaymentStatus.CANCELLED
+    assert calls[-1][2]["options"] == {"idempotency_key": f"cancel:{pay_id}"}
+    assert p.get_payment("pi_1").status == PaymentStatus.AUTHORIZED
+
+
+@pytest.mark.parametrize("stripe_status,expected", [
+    ("requires_payment_method", "PENDING"), ("requires_confirmation", "PENDING"),
+    ("requires_action", "REQUIRES_ACTION"), ("processing", "PROCESSING"), ("requires_capture", "AUTHORIZED"),
+    ("succeeded", "PAID"), ("canceled", "CANCELLED"),
+])
+def test_estados_de_stripe_se_traducen(stripe_status, expected):
+    client, _ = stub(**{"pi.retrieve": {"id": "pi_1", "status": stripe_status, "amount": 1}})
+    assert StripePaymentProvider(settings(), client).get_payment("pi_1").status.value == expected
+
+
+def test_intento_rechazado_sin_otro_metodo_es_fallido():
+    client, _ = stub(**{"pi.retrieve": {"id": "pi_1", "status": "requires_payment_method", "amount": 1,
+                                        "last_payment_error": {"code": "card_declined", "decline_code": "lost_card"}}})
+    pp = StripePaymentProvider(settings(), client).get_payment("pi_1")
+    assert pp.status.value == "FAILED" and pp.failure_code == "lost_card"
+
+
+def test_error_de_red_al_capturar_es_reintentable():
+    client, _ = stub(**{"pi.capture": stripe.APIConnectionError("red")})
+    with pytest.raises(ProviderError) as err:
+        StripePaymentProvider(settings(), client).capture("pi_1", uuid.UUID(int=9), 1)
+    assert err.value.retryable

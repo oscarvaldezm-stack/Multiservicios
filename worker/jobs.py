@@ -7,6 +7,8 @@ Trabajos periódicos del negocio (proceso aparte del worker de documentos, que n
 - KYC: libera casos tomados y abandonados; vence aprobaciones con identificación vencida o
   revalidación cumplida (y el técnico pierde en ese momento sus órdenes no iniciadas).
 - Órdenes: aprobación automática a las 72 h (decisión D5); solicitudes sin técnico caducan.
+- Pagos: aprobación y captura 24 h antes de que venza la autorización; captura de las órdenes
+  aprobadas (idempotente en el proveedor: capture:{pago}); limpieza de Idempotency-Keys vencidas.
 
 Cada trabajo corre en su propia transacción: si uno falla, los demás siguen. Un candado
 consultivo de PostgreSQL evita que dos réplicas ejecuten el mismo ciclo a la vez.
@@ -24,6 +26,8 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.kyc import decisions
 from app.orders import service as orders
+from app.payments import idempotency
+from app.payments import service as payments
 from app.security import log_sanitizer
 
 log = logging.getLogger("jobs")
@@ -34,6 +38,9 @@ JOBS: dict[str, Callable[[Session], int]] = {
     "kyc.expire_approvals": decisions.expire_approvals,
     "orders.auto_approve": orders.auto_approve,
     "orders.expire_requests": orders.expire_requests,
+    "payments.enforce_capture_deadline": payments.enforce_capture_deadline,
+    "payments.capture_due": payments.capture_due,
+    "payments.purge_idempotency_keys": idempotency.purge_expired,
 }
 
 

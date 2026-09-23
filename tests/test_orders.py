@@ -196,9 +196,20 @@ def test_limite_de_solicitudes_abiertas(client, db, category, people, monkeypatc
 
 
 # ------------------------------------------------------------------ pagos
-def test_pago_fallido_deja_la_orden_fallida(client, db, category, people):
+def test_rechazo_antes_de_salir_no_tumba_la_orden(client, db, category, people):
+    """Fase 3: si el cobro se rechaza antes de iniciar, la orden sigue y el cliente elige otra tarjeta."""
     _, th, _, ch = people
     oid = run_order(client, db, ch, th, category, until="SCHEDULED")
+    first = payment_of(db, oid)
+    webhook(db, oid, "failed")
+    assert order_status(db, oid) == "SCHEDULED"
+    new = payment_of(db, oid)
+    assert new.id != first.id and new.status == PaymentStatus.PENDING and new.amount_cents == first.amount_cents
+
+
+def test_pago_fallido_al_capturar_deja_la_orden_fallida(client, db, category, people):
+    _, th, _, ch = people
+    oid = run_order(client, db, ch, th, category, until="COMPLETED")
     webhook(db, oid, "failed")
     assert order_status(db, oid) == "FAILED"
 

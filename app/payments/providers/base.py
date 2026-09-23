@@ -6,8 +6,8 @@ esta interfaz, y cada proveedor es un adaptador que traduce sus objetos a los ti
 de este módulo. Agregar Mercado Pago = un adaptador nuevo, sin tocar tablas ni reglas.
 
 Fase 2: cuentas conectadas del técnico, cliente del proveedor y guardado de tarjeta.
-Las fases 3 a 5 agregan authorize / capture / cancel_authorization / refund / get_payment /
-verify_webhook / payouts / disputes a este mismo contrato.
+Fase 3: autorizar (captura manual con cargo de destino), capturar, anular y consultar un cobro.
+Las fases 4 y 5 agregan verify_webhook / refund / payouts / disputes a este mismo contrato.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from app.core.errors import DomainError
+from app.models.enums import PaymentStatus
 
 
 class ProviderError(DomainError):
@@ -94,6 +95,34 @@ class SavedCard:
     exp_year: int
 
 
+@dataclass(frozen=True)
+class AuthorizationRequest:
+    """Todo lo calcula el backend: monto, comisión y cuenta destino nunca vienen de la app."""
+
+    payment_id: uuid.UUID
+    order_id: uuid.UUID
+    amount_cents: int
+    currency: str
+    customer_id: str
+    payment_method_id: str
+    destination_account_id: str        # cuenta conectada del técnico (transfer_data[destination])
+    application_fee_cents: int         # comisión + IVA + retenciones: lo que se queda la plataforma
+
+
+@dataclass(frozen=True)
+class ProviderPayment:
+    """Estado de un cobro en el proveedor, ya traducido a los estados propios."""
+
+    provider_payment_id: str | None
+    status: PaymentStatus
+    amount_cents: int = 0
+    amount_capturable_cents: int = 0
+    amount_received_cents: int = 0
+    failure_code: str | None = None
+    payment_method_fingerprint: str | None = None
+    client_secret: str | None = field(default=None, repr=False)   # solo para que el dueño complete 3D Secure
+
+
 class PaymentProvider(abc.ABC):
     name: str
     capabilities: Capabilities
@@ -123,3 +152,24 @@ class PaymentProvider(abc.ABC):
     @abc.abstractmethod
     def list_saved_cards(self, provider_customer_id: str) -> list[SavedCard]:
         """Tarjetas guardadas (solo marca, últimos 4 y vencimiento)."""
+
+    # ---------------------------------------------------------------- cobros (Fase 3)
+    @abc.abstractmethod
+    def authorize(self, req: AuthorizationRequest) -> ProviderPayment:
+        """
+        Reserva el monto en la tarjeta guardada, sin el cliente presente, con su división.
+        Idempotente por pago. Un rechazo NO es excepción: vuelve con status FAILED y su código;
+        si el banco pide autenticación, vuelve REQUIRES_ACTION con el client_secret.
+        """
+
+    @abc.abstractmethod
+    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int) -> ProviderPayment:
+        """Cobra lo autorizado (idempotente por pago: nunca dos capturas)."""
+
+    @abc.abstractmethod
+    def cancel_authorization(self, provider_payment_id: str, payment_id: uuid.UUID) -> ProviderPayment:
+        """Libera la reserva (idempotente)."""
+
+    @abc.abstractmethod
+    def get_payment(self, provider_payment_id: str) -> ProviderPayment:
+        """Estado real del cobro en el proveedor (fuente de verdad)."""

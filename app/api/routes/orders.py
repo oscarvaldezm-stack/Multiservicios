@@ -5,21 +5,29 @@
 - Técnico APROBADO: ver solicitudes de sus categorías, aceptar, agendar, retirarse,
   iniciar (con pago autorizado) y terminar.
 - Cualquier orden ajena responde 404 (sin confirmar que existe).
-El estado de pago NO se puede cambiar desde aquí: solo lo cambia el proveedor (webhook).
+El estado de pago NO se puede cambiar desde aquí: solo lo cambia el proveedor (su respuesta a
+una llamada del backend o su webhook). El cliente solo elige CON QUÉ TARJETA paga (Idempotency-Key)
+y el técnico marca "en camino", que autoriza el cobro.
 """
 from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Header, Path, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import or_, select
 
 from app.api.deps import CurrentClient, CurrentTechnician, CurrentUser, DbSession, ReqCtx, VerifiedTechnician, \
     require_permission, require_roles
 from app.core.actor import Actor
+from app.core.errors import DomainError
 from app.kyc.permissions import Permission
-from app.models import OrderStatus, ServiceOrder, UserRole
+from app.models import OrderStatus, Payment, ServiceOrder, User, UserRole
 from app.orders import service
+from app.payments import idempotency
+from app.payments import service as payments
+from app.payments.commission import from_cents
+from app.schemas.payments import DepartOut, OrderPaymentClientOut, OrderPaymentTechnicianOut, PaymentMethodIn
 from app.schemas.marketplace import (
     AcceptIn,
     DisputeIn,
@@ -126,6 +134,20 @@ def withdraw_order(data: ReasonIn, tech: CurrentTechnician, db: DbSession, ctx: 
     return order
 
 
+@router.post("/{order_id}/depart", response_model=DepartOut,
+             summary="En camino (técnico): autoriza el cobro en la tarjeta del cliente; si falla, no salgas")
+def depart(tech: VerifiedTechnician, db: DbSession, ctx: ReqCtx, order_id: uuid.UUID = OrderId):
+    try:
+        order, payment = service.depart(db, tech, order_id, ctx)
+    except DomainError as exc:
+        if exc.code == "ORDER_PAYMENT_METHOD_MISSING":
+            db.commit()                      # conserva el aviso al cliente para que elija tarjeta
+        raise
+    db.commit()
+    return DepartOut(order_id=str(order.id), payment_status=payment.status,
+                     can_start=payment.status.value == "AUTHORIZED", failure_code=payment.failure_code)
+
+
 @router.post("/{order_id}/start", response_model=OrderOut, summary="Iniciar trabajo (técnico APROBADO, pago autorizado)")
 def start_order(tech: VerifiedTechnician, db: DbSession, ctx: ReqCtx, order_id: uuid.UUID = OrderId):
     order = service.start(db, tech, order_id, ctx)
@@ -169,3 +191,66 @@ def resolve_dispute(data: DisputeResolutionIn, db: DbSession, ctx: ReqCtx, order
     order = service.resolve_dispute(db, admin, order_id, data.outcome, data.refund_amount, data.note, ctx)
     db.commit()
     return order
+
+
+# ------------------------------------------------------------------ pago de la orden (Fase 3)
+def _client_view(payment: Payment, client_secret: str | None = None) -> OrderPaymentClientOut:
+    b = payment.breakdown
+    return OrderPaymentClientOut(
+        status=payment.status, currency=payment.currency, total=from_cents(payment.amount_cents),
+        service_price=from_cents(b.price_cents), service_tax=from_cents(b.service_tax_cents),
+        discount=from_cents(b.discount_cents), payment_method_selected=payment.provider_payment_method_id is not None,
+        authorized_at=payment.authorized_at, captured_at=payment.captured_at,
+        refunded=from_cents(payment.refunded_cents), client_secret=client_secret)
+
+
+def _technician_view(payment: Payment) -> OrderPaymentTechnicianOut:
+    b = payment.breakdown
+    return OrderPaymentTechnicianOut(
+        status=payment.status, currency=payment.currency, service_price=from_cents(b.price_cents),
+        commission=from_cents(b.commission_cents), commission_tax=from_cents(b.commission_tax_cents),
+        withholding_isr=from_cents(b.withholding_isr_cents), withholding_iva=from_cents(b.withholding_iva_cents),
+        net=from_cents(b.technician_cents), authorized_at=payment.authorized_at, captured_at=payment.captured_at,
+        capture_deadline=payment.capture_deadline)
+
+
+def _payment_or_404(db, user: User, order_id: uuid.UUID, *, lock: bool = False) -> Payment:
+    order = service.get_for_user(db, user, order_id, lock=lock)         # dueño o técnico asignado; si no, 404
+    payment = payments.active_payment(db, order.id, lock=lock)
+    if payment is None:
+        raise DomainError("La orden todavía no tiene un pago", code="ORDER_NO_PAYMENT", http_status=404)
+    return payment
+
+
+@router.get("/{order_id}/payment", response_model=OrderPaymentClientOut | OrderPaymentTechnicianOut,
+            summary="Pago de la orden (el cliente ve su total; el técnico, lo que recibe)")
+def get_order_payment(user: CurrentUser, db: DbSession, order_id: uuid.UUID = OrderId):
+    payment = _payment_or_404(db, user, order_id)
+    if user.role == UserRole.TECHNICIAN:
+        return _technician_view(payment)
+    return _client_view(payment, payments.client_secret_for_action(payment))
+
+
+@router.post("/{order_id}/payment-method", response_model=OrderPaymentClientOut,
+             summary="Elegir con qué tarjeta guardada se paga (cliente; requiere Idempotency-Key)")
+def choose_payment_method(data: PaymentMethodIn, client: CurrentClient, db: DbSession,
+                          idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+                          order_id: uuid.UUID = OrderId):
+    def operation() -> dict:
+        order = service.get_for_user(db, client, order_id, lock=True)
+        payment = payments.set_payment_method(db, client, order, data.payment_method_id)
+        return _client_view(payment).model_dump(mode="json")
+
+    code, body, replayed = idempotency.run(db, user_id=client.id, endpoint=f"orders/{order_id}/payment-method",
+                                           key=idempotency_key, body=data.model_dump(), operation=operation)
+    db.commit()
+    return JSONResponse(body, status_code=code, headers={"Idempotent-Replayed": "true"} if replayed else None)
+
+
+@router.post("/{order_id}/payment/refresh", response_model=OrderPaymentClientOut,
+             summary="Volver a consultar el cobro en el proveedor (cliente; nunca recibe un estado)")
+def refresh_order_payment(client: CurrentClient, db: DbSession, order_id: uuid.UUID = OrderId):
+    payment = _payment_or_404(db, client, order_id, lock=True)
+    payments.refresh_from_provider(db, payment)
+    db.commit()
+    return _client_view(payment, payments.client_secret_for_action(payment))
