@@ -115,6 +115,24 @@ class Settings(BaseSettings):
     # Vigencia de una autorización con tarjeta guardada (Visa, sin el cliente presente: ~4 d 18 h).
     PAYMENT_AUTHORIZATION_VALID_HOURS: int = Field(default=114, ge=1, le=24 * 30)
 
+    # --- Pagos (Fase 2: Stripe) ------------------------------------------------------------
+    # "fake" = proveedor en memoria para desarrollo y pruebas (prohibido en producción).
+    PAYMENT_PROVIDER_BACKEND: Literal["stripe", "fake"] = "fake"
+    # Clave secreta SOLO en el backend. Preferir una clave restringida (rk_) con permisos mínimos.
+    STRIPE_SECRET_KEY: SecretStr | None = None
+    # La única clave que viaja a la app (Flutter / web).
+    STRIPE_PUBLISHABLE_KEY: str | None = None
+    # Un secreto de firma DISTINTO por endpoint de webhook (plataforma y Connect). Se usan en la Fase 4.
+    STRIPE_WEBHOOK_SECRET: SecretStr | None = None
+    STRIPE_CONNECT_WEBHOOK_SECRET: SecretStr | None = None
+    # Versión de la API fijada: un cambio de Stripe no altera el comportamiento sin un despliegue revisado.
+    STRIPE_API_VERSION: str = Field(default="2026-08-26.dahlia", min_length=10, max_length=40)
+    STRIPE_MAX_NETWORK_RETRIES: int = Field(default=2, ge=0, le=5)
+    # Adónde vuelve el técnico al terminar (o al vencer) el formulario de Stripe. HTTPS en producción.
+    STRIPE_CONNECT_RETURN_URL: str = "http://localhost:3000/pagos/cuenta/listo"
+    STRIPE_CONNECT_REFRESH_URL: str = "http://localhost:3000/pagos/cuenta/reintentar"
+    PAYMENT_ACCOUNT_COUNTRY: str = Field(default="MX", pattern=r"^[A-Z]{2}$")
+
     # --- Reseñas -------------------------------------------------------------------------
     REVIEW_WINDOW_DAYS: int = Field(default=30, ge=1)          # para calificar después del pago
     REVIEW_EDIT_HOURS: int = Field(default=24, ge=1)
@@ -156,6 +174,40 @@ class Settings(BaseSettings):
     def _payment_range(self) -> "Settings":
         if self.PAYMENT_MIN_SERVICE_CENTS >= self.PAYMENT_MAX_SERVICE_CENTS:
             raise ValueError("PAYMENT_MIN_SERVICE_CENTS debe ser menor que PAYMENT_MAX_SERVICE_CENTS")
+        return self
+
+    @model_validator(mode="after")
+    def _stripe_keys(self) -> "Settings":
+        """Formato de las claves, modo prueba/producción coherente y un secreto por webhook."""
+        sk = self.STRIPE_SECRET_KEY.get_secret_value() if self.STRIPE_SECRET_KEY else None
+        pk = self.STRIPE_PUBLISHABLE_KEY
+        if sk is not None and not sk.startswith(("sk_test_", "sk_live_", "rk_test_", "rk_live_")):
+            raise ValueError("STRIPE_SECRET_KEY debe ser una clave secreta (sk_) o restringida (rk_) de Stripe")
+        if pk is not None and not pk.startswith(("pk_test_", "pk_live_")):
+            raise ValueError("STRIPE_PUBLISHABLE_KEY debe ser una clave publicable (pk_)")
+        hooks = [h.get_secret_value() for h in (self.STRIPE_WEBHOOK_SECRET, self.STRIPE_CONNECT_WEBHOOK_SECRET) if h]
+        if any(not h.startswith("whsec_") for h in hooks):
+            raise ValueError("Los secretos de webhook de Stripe empiezan con whsec_")
+        if len(hooks) == 2 and hooks[0] == hooks[1]:
+            raise ValueError("STRIPE_WEBHOOK_SECRET y STRIPE_CONNECT_WEBHOOK_SECRET deben ser distintos")
+        if self.PAYMENT_PROVIDER_BACKEND == "stripe":
+            if not sk or not pk:
+                raise ValueError("Con PAYMENT_PROVIDER_BACKEND=stripe se requieren STRIPE_SECRET_KEY y STRIPE_PUBLISHABLE_KEY")
+            if ("_live_" in sk) != ("_live_" in pk):
+                raise ValueError("STRIPE_SECRET_KEY y STRIPE_PUBLISHABLE_KEY deben ser del mismo modo (prueba o producción)")
+        live = [k for k in (sk, pk) if k and "_live_" in k]
+        if self.ENVIRONMENT == "production":
+            if self.PAYMENT_PROVIDER_BACKEND != "stripe":
+                raise ValueError("En producción PAYMENT_PROVIDER_BACKEND debe ser stripe")
+            if len(live) != 2:
+                raise ValueError("En producción las claves de Stripe deben ser de modo live (nunca sk_test_/pk_test_)")
+            if len(hooks) != 2:
+                raise ValueError("En producción se requieren STRIPE_WEBHOOK_SECRET y STRIPE_CONNECT_WEBHOOK_SECRET")
+            if not (self.STRIPE_CONNECT_RETURN_URL.startswith("https://")
+                    and self.STRIPE_CONNECT_REFRESH_URL.startswith("https://")):
+                raise ValueError("En producción las URLs de retorno de Stripe deben ser HTTPS")
+        elif live:
+            raise ValueError("Fuera de producción no se permiten claves live de Stripe: usa las de modo prueba")
         return self
 
     @model_validator(mode="after")

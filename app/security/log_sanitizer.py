@@ -23,6 +23,10 @@ _RULES: list[tuple[re.Pattern[str], object]] = [
     (re.compile(r"(/kyc/file-views/)[A-Za-z0-9._-]+"), r"\1[TICKET-REDACTADO]"),
     # Llaves de Stripe
     (re.compile(r"\b(sk|rk|whsec)_(live|test)?_?[A-Za-z0-9]{8,}\b"), "[LLAVE-PROVEEDOR-REDACTADA]"),
+    # client_secret de PaymentIntent / SetupIntent (permite confirmar el pago desde la app)
+    (re.compile(r"\b(pi|seti)_[A-Za-z0-9]+_secret_[A-Za-z0-9]+\b"), "[CLIENT-SECRET-REDACTADO]"),
+    # Enlaces de un solo uso del formulario de alta de Stripe (quien los tenga entra a la cuenta del técnico)
+    (re.compile(r"https://connect\.stripe\.com/[^\s\"']+"), "https://connect.stripe.com/[ENLACE-REDACTADO]"),
     # CURP y RFC de persona física
     (re.compile(r"\b[A-Z][AEIOUX][A-Z]{2}\d{6}[HMX][A-Z]{5}[A-Z\d]\d\b"), lambda m: m.group(0)[:4] + "**************"),
     (re.compile(r"\b[A-ZÑ&]{4}\d{6}[A-Z\d]{3}\b"), lambda m: m.group(0)[:4] + "*********"),

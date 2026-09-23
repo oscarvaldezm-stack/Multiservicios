@@ -1,6 +1,6 @@
 # Multiservicios API: Backend
 
-Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable).
+Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta).
 
 FastAPI · SQLAlchemy 2.0 · PostgreSQL · OAuth2 Password Flow + JWT · Passlib/bcrypt
 
@@ -39,7 +39,10 @@ app/
 │   ├── service.py       # Crear, anular y aplicar eventos del proveedor sobre un pago (nunca desde la app)
 │   ├── commission.py    # CommissionEngine: centavos, IVA, retenciones, reglas y costo del proveedor
 │   ├── state_machine.py # ALLOWED_PAYMENT_TRANSITIONS + move(): única vía para cambiar el estado del pago
-│   └── ledger.py        # Libro de partida doble (cada grupo de asientos suma cero)
+│   ├── ledger.py        # Libro de partida doble (cada grupo de asientos suma cero)
+│   ├── accounts.py      # Cuenta de pagos del técnico: alta, formulario de Stripe, estado, bloqueos
+│   ├── customers.py     # Cliente en Stripe y guardado de tarjeta (SetupIntent)
+│   └── providers/       # Contrato PaymentProvider, adaptador de Stripe y proveedor falso
 ├── reviews/             # Calificaciones: servicio, antifraude, reputación, firma de integridad, filtros de texto
 ├── audit/writer.py      # Auditoría con cadena de hashes y verify_chain()
 ├── schemas/auth.py      # Validación Pydantic (frontera de entrada/salida)
@@ -54,9 +57,10 @@ app/
 │       ├── admin_documents.py # Ver documentos, tickets, bitácora de auditoría
 │       ├── admin_kyc_decisions.py # Tomar casos, decidir documentos y expedientes, suspender
 │       ├── orders.py          # /orders, /clients/me/orders, /technicians/me/jobs-feed, /admin/orders
-│       └── reviews.py         # /reviews, /technicians/{id}/reviews, /admin/reviews
+│       ├── reviews.py         # /reviews, /technicians/{id}/reviews, /admin/reviews
+│       └── payments.py        # /technicians/me/payment-account, /clients/me/payment-methods
 └── main.py              # App, CORS, TrustedHost, headers de seguridad
-migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable
+migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico
 scripts/
 ├── init_db.py           # Solo desarrollo: aplica migraciones y carga categorías
 ├── create_admin.py      # Único camino para crear administradores
@@ -65,7 +69,7 @@ scripts/
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
 worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
-tests/                   # 506 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+tests/                   # 563 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
@@ -702,7 +706,7 @@ Cada movimiento es un grupo de asientos que suma cero; la tabla es de solo inser
 
 ### 11.7 Siguiente: Fase 2 de pagos
 
-Configuración segura de Stripe (claves restringidas, separación prueba/producción), `PaymentProvider` + `StripePaymentProvider` en modo prueba, alta del técnico con cuenta conectada (solo con KYC aprobado) y guardado de tarjeta con SetupIntent.
+Hecha: ver la sección 12.
 
 ### 11.8 Limitaciones conocidas
 
@@ -710,3 +714,85 @@ Configuración segura de Stripe (claves restringidas, separación prueba/producc
 - **Comisión de Stripe real**: el costo del proveedor es una estimación configurable; el asiento `PROVIDER_FEES` se registra cuando la Fase 4 lea la transacción de saldo de Stripe.
 - **Revisión fiscal y legal**: tasas de retención, quién emite el CFDI al cliente y si el modelo requiere licencia bajo la Ley Fintech están pendientes de validar con contador y abogado.
 - El downgrade de la migración 0006 se niega si hay pagos (perdería el desglose).
+
+---
+
+## 12. Pagos, Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta
+
+### 12.1 Configuración segura
+
+| Variable | Para qué | Reglas que valida la app al arrancar |
+|---|---|---|
+| `PAYMENT_PROVIDER_BACKEND` | `stripe` o `fake` (en memoria, desarrollo y pruebas) | En producción solo `stripe` |
+| `STRIPE_SECRET_KEY` | Clave del backend | Debe ser `sk_` o, mejor, restringida `rk_` con permisos mínimos |
+| `STRIPE_PUBLISHABLE_KEY` | La única clave que va a la app | `pk_`; mismo modo (prueba/producción) que la secreta |
+| `STRIPE_WEBHOOK_SECRET`, `STRIPE_CONNECT_WEBHOOK_SECRET` | Firma de los webhooks (Fase 4) | `whsec_`, distintos entre sí; obligatorios en producción |
+| `STRIPE_API_VERSION` | Versión de la API fijada (`2026-08-26.dahlia`) | Un cambio de Stripe no altera el comportamiento sin un despliegue |
+| `STRIPE_CONNECT_RETURN_URL` / `_REFRESH_URL` | Adónde vuelve el técnico desde el formulario de Stripe | HTTPS en producción |
+
+La app **no arranca** si en producción las claves son de prueba (`sk_test_`/`pk_test_`) o si fuera de producción son `live`. La clave secreta nunca aparece en `repr`, logs ni respuestas; el filtro de logs enmascara claves (`sk_`, `rk_`, `whsec_`), `client_secret` de PaymentIntent/SetupIntent y enlaces de alta de `connect.stripe.com`.
+
+**Claves restringidas sugeridas para `rk_`** (Fase 2): escritura en *Accounts*, *Account Links*, *Customers* y *SetupIntents*; lectura en *PaymentMethods*. Las fases 3 a 5 agregan *PaymentIntents*, *Refunds* y *Disputes*.
+
+### 12.2 Capa PaymentProvider (`app/payments/providers/`)
+
+- `base.py`: el contrato, con tipos propios (`AccountPrefill`, `AccountStatusInfo`, `OnboardingLink`, `SetupIntentInfo`, `SavedCard`) y `Capabilities` (el adaptador declara lo que soporta). Ningún objeto de Stripe sale del adaptador.
+- `stripe_provider.py`: `StripePaymentProvider` sobre `stripe.StripeClient` (SDK oficial 15.x). Idempotency-Key determinista al crear la cuenta del técnico (`account-create:{técnico}`) y el cliente (`customer-create:{usuario}`). Los errores de Stripe se traducen a códigos propios sin su mensaje (puede traer datos personales o la clave):
+
+| Error de Stripe | Código | HTTP |
+|---|---|---|
+| RateLimit / conexión | `PAYMENT_PROVIDER_UNAVAILABLE` (reintentable) | 503 |
+| Autenticación / permisos | `PAYMENT_PROVIDER_MISCONFIGURED` (log de seguridad) | 503 |
+| Solicitud inválida | `PAYMENT_PROVIDER_REJECTED` | 502 |
+| Tarjeta rechazada | `PAYMENT_CARD_DECLINED` | 402 |
+| Idempotencia con otro cuerpo | `PAYMENT_PROVIDER_IDEMPOTENCY` | 409 |
+
+- `fake.py`: el mismo contrato en memoria, con utilidades para simular lo que pasa fuera de la app (el técnico completa el formulario, Stripe pide más datos o rechaza la cuenta).
+
+### 12.3 Cuenta de pagos del técnico (`app/payments/accounts.py`)
+
+| Método y ruta | Quién | Respuestas |
+|---|---|---|
+| `POST /api/v1/technicians/me/payment-account` | Técnico con KYC `APPROVED` | 201; 403 `KYC_NOT_APPROVED`; 409 `PAYMENT_ACCOUNT_EXISTS`; 503 si Stripe no responde (no queda nada a medias) |
+| `GET /api/v1/technicians/me/payment-account` | Técnico | 200 (estado, pendientes, `can_receive_payments`, `in_review`) |
+| `POST /api/v1/technicians/me/payment-account/onboarding-link` | Técnico con KYC `APPROVED` | 200 con URL de un solo uso; 404 sin cuenta; 409 `PAYMENT_ACCOUNT_DISABLED` |
+| `POST /api/v1/technicians/me/payment-account/refresh` | Técnico | 200: vuelve a consultar a Stripe (máximo una vez cada 15 s); nunca recibe un estado |
+| `POST /api/v1/admin/payment-accounts/{id}/name-review` | `KYC_SUPERVISOR` o `FINANCE_ADMIN` | Libera o rechaza una cuenta con nombre distinto al del KYC (auditado) |
+
+Todos los cuerpos usan `extra="forbid"`: mandar `status`, `account_id` o cualquier campo da 422. Las respuestas no exponen el id de la cuenta en Stripe.
+
+**Alta:** cuenta Express de México, persona física, con la capacidad `transfers`. Se precargan nombre legal, fecha de nacimiento, domicilio, correo y teléfono (solo en formato +52) del expediente KYC. **No se envían CURP ni RFC**: si Stripe los necesita, los pide en su formulario. Esta transferencia de datos a Stripe debe declararse en el aviso de privacidad. La CLABE la captura Stripe; nosotros no la vemos.
+
+**Estados** (`ALLOWED_ACCOUNT_TRANSITIONS`, repetidos en un trigger de la migración 0007): `NOT_CREATED → ONBOARDING → PENDING_VERIFICATION → ENABLED ⇄ RESTRICTED`, y `DISABLED` cuando Stripe rechaza la cuenta. El estado se deriva de lo que reporta Stripe (`transfers` activa, `payouts_enabled`, requisitos pendientes, `disabled_reason`), nunca de la app. El trigger además impide borrar la fila, cambiar técnico o proveedor, o cambiar el id de la cuenta una vez asignado.
+
+**Bloqueos de la plataforma** (independientes del estado en Stripe; una cuenta `ENABLED` pero bloqueada no recibe pagos nuevos):
+
+| Motivo | Cuándo | Cómo se quita |
+|---|---|---|
+| `KYC_SUSPENDED` / `KYC_EXPIRED` | Al suspender o vencer el KYC | Solo al volver a aprobarse el KYC (reactivar no basta) |
+| `NAME_MISMATCH` | El nombre en Stripe no coincide con el del KYC (se compara sin acentos ni mayúsculas; basta el apellido paterno) | Un supervisor lo revisa: lo libera o lo rechaza |
+| `NAME_REJECTED` | El supervisor confirmó que no es el titular | No se quita automáticamente |
+
+Una diferencia de nombre genera una alerta a supervisión (`payment_account.name_mismatch`); al técnico solo se le muestra "en revisión". Si Stripe no expone el nombre para ese tipo de cuenta, la comparación queda sin dato y no bloquea.
+
+### 12.4 Tarjetas del cliente (`app/payments/customers.py`)
+
+| Método y ruta | Quién | Respuesta |
+|---|---|---|
+| `POST /api/v1/clients/me/payment-methods/setup-intent` | Cliente | 201 `{client_secret, publishable_key}` |
+| `GET /api/v1/clients/me/payment-methods` | Cliente | Marca, últimos 4 y vencimiento de sus tarjetas |
+
+La app usa el `client_secret` con el componente oficial de Stripe (PaymentSheet en Flutter, Payment Element en web): la tarjeta va directo a Stripe y la plataforma queda en PCI SAQ A. El SetupIntent es `off_session` (se cobrará cuando el técnico salga, sin el cliente presente) y solo con tarjeta (decisión D3). Se crea un solo cliente en Stripe por usuario.
+
+### 12.5 Pruebas
+
+`tests/test_payments_provider.py` (configuración segura y producción, adaptador de Stripe con un cliente simulado que verifica los parámetros exactos y la idempotencia, traducción de errores sin filtrar datos, logs) y `tests/test_payments_accounts.py` (alta con y sin KYC, precarga sin CURP ni RFC, 409 y proveedor caído, campos colados, roles, estados según el proveedor, límite de consultas, nombre distinto y su revisión, bloqueo por suspensión y vencimiento del KYC, reaprobación por la API, trigger, tarjetas y aislamiento entre clientes).
+
+**Prueba contra Stripe real (pendiente de tu lado):** este entorno no tiene salida a `api.stripe.com`. Con tu cuenta en modo prueba: pon `PAYMENT_PROVIDER_BACKEND=stripe` y tus claves `sk_test_`/`pk_test_` en `.env`, crea un técnico aprobado, llama a `POST /technicians/me/payment-account`, abre el enlace de `onboarding-link` y completa el formulario con los datos de prueba de Stripe; después `refresh` debe mostrar `ENABLED`.
+
+### 12.6 Limitaciones conocidas
+
+- **Regla crítica en órdenes:** `accounts.can_receive_payments()` ya existe, pero exigir "KYC aprobado **y** cuenta habilitada" para aceptar órdenes y autorizar cobros llega en la Fase 3, junto con la autorización.
+- **Actualización automática:** el estado de la cuenta se actualiza al consultar (`refresh`); el webhook `account.updated` que lo hará solo llega en la Fase 4.
+- La idempotencia de Stripe dura 24 h: un reintento de alta después de ese plazo, con la fila perdida, podría crear otra cuenta en Stripe (la base sigue teniendo una sola).
+- El límite de SetupIntents por cliente lo da Nginx (por IP); no hay un conteo por usuario.

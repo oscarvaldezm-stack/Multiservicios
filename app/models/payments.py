@@ -72,9 +72,20 @@ class TechnicianPaymentAccount(TimestampMixin, Base):
     )
     transfers_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     payouts_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    details_submitted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     requirements_due: Mapped[list[str] | None] = mapped_column(JSONB)
+    provider_disabled_reason: Mapped[str | None] = mapped_column(String(80))
     name_matches_kyc: Mapped[bool | None] = mapped_column(Boolean)
+    # Bloqueo de la PLATAFORMA (KYC suspendido o vencido, nombre distinto al del KYC). Independiente del
+    # estado en el proveedor: una cuenta ENABLED pero bloqueada no recibe pagos nuevos.
     blocked_reason: Mapped[str | None] = mapped_column(String(60))
+    enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+    @property
+    def can_receive_payments(self) -> bool:
+        return self.status == PaymentAccountStatus.ENABLED and self.blocked_reason is None
 
 
 class PaymentCustomer(Base):

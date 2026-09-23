@@ -15,6 +15,7 @@ Pillow>=10.3                # validación y re-codificación de imágenes (quita
 pypdf>=3.17,<6              # inspección estructural de PDF (JavaScript, adjuntos, cifrado)
 pypdfium2>=4.20             # PDF -> imagen para el revisor (nunca se le entrega el PDF)
 boto3>=1.34                 # S3 con SSE-KMS
+stripe>=15.6,<16            # SDK oficial de Stripe; la versión de la API se fija en STRIPE_API_VERSION
 
 # Pruebas
 pytest>=8.0

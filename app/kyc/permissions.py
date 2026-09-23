@@ -39,6 +39,7 @@ class Permission(str, enum.Enum):
     REVIEWS_REMOVE = "reviews:remove"              # eliminar (decisión final)
     # Pagos (Fase 1)
     COMMISSION_RULES_MANAGE = "finance:commission_rules:manage"   # crear y cerrar reglas de comisión
+    PAYMENT_ACCOUNTS_REVIEW = "finance:payment_accounts:review"   # revisar cuentas con nombre distinto al KYC
 
 
 P = Permission
@@ -51,7 +52,7 @@ ROLE_PERMISSIONS: dict[AdminRole, frozenset[Permission]] = {
     AdminRole.KYC_SUPERVISOR: frozenset({
         P.KYC_QUEUE_READ, P.KYC_CASE_CLAIM, P.KYC_CASE_READ_ASSIGNED, P.KYC_CASE_READ_ANY,
         P.KYC_DOCUMENT_DECIDE, P.KYC_APPROVE, P.KYC_REQUEST_CORRECTION, P.KYC_REJECT_FINAL,
-        P.KYC_SUSPEND, P.KYC_REINSTATE, P.AUDIT_READ,
+        P.KYC_SUSPEND, P.KYC_REINSTATE, P.AUDIT_READ, P.PAYMENT_ACCOUNTS_REVIEW,
     }),
     AdminRole.SUPPORT: frozenset({P.KYC_QUEUE_READ, P.USERS_READ, P.ORDERS_READ, P.REVIEWS_READ,
                                   P.REVIEWS_MODERATE}),
@@ -62,7 +63,8 @@ ROLE_PERMISSIONS: dict[AdminRole, frozenset[Permission]] = {
     # Roles de finanzas: sin permisos KYC; resuelven disputas de dinero.
     AdminRole.FINANCE_VIEWER: frozenset({P.ORDERS_READ}),
     AdminRole.FINANCE_OPERATOR: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE}),
-    AdminRole.FINANCE_ADMIN: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE, P.COMMISSION_RULES_MANAGE}),
+    AdminRole.FINANCE_ADMIN: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE, P.COMMISSION_RULES_MANAGE,
+                                        P.PAYMENT_ACCOUNTS_REVIEW}),
     # Moderación de contenido: única que puede PUBLICAR (revertir un ocultamiento) y ELIMINAR reseñas (la bitácora de cada reseña va en su detalle).
     AdminRole.CONTENT_MODERATOR: frozenset({P.REVIEWS_READ, P.REVIEWS_MODERATE, P.REVIEWS_PUBLISH,
                                             P.REVIEWS_REMOVE}),

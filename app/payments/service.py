@@ -61,7 +61,7 @@ def active_payment(db: Session, order_id: uuid.UUID, *, lock: bool = False) -> P
     stmt = select(Payment).where(Payment.service_order_id == order_id, Payment.kind == PaymentKind.SERVICE,
                                  Payment.status.in_(LIVE))
     if lock:
-        stmt = stmt.with_for_update()
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     return db.scalar(stmt)
 
 

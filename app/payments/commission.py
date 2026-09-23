@@ -338,7 +338,7 @@ def create_rule(db: Session, actor: Actor, *, scope: CommissionScope, scope_ref:
         CommissionRule.scope == scope,
         CommissionRule.scope_ref.is_(None) if ref is None else CommissionRule.scope_ref == ref,
         or_(CommissionRule.valid_to.is_(None), CommissionRule.valid_to > valid_from),
-    ).with_for_update()
+    ).with_for_update().execution_options(populate_existing=True)
     closed: list[int] = []
     for current in db.scalars(same_scope).all():
         if current.valid_from >= valid_from:
@@ -366,7 +366,7 @@ def close_rule(db: Session, actor: Actor, rule_id: int, *, valid_to: datetime | 
                ctx: RequestContext | None = None) -> CommissionRule:
     """Termina una regla (p. ej. una excepción por categoría). La regla GLOBAL no se cierra sin reemplazo."""
     _require_manager(actor)
-    rule = db.scalar(select(CommissionRule).where(CommissionRule.id == rule_id).with_for_update())
+    rule = db.scalar(select(CommissionRule).where(CommissionRule.id == rule_id).with_for_update().execution_options(populate_existing=True))
     if rule is None:
         raise CommissionError("Regla no encontrada", code="COMMISSION_RULE_NOT_FOUND", http_status=404)
     if rule.scope == CommissionScope.GLOBAL:

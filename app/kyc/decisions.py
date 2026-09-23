@@ -292,6 +292,9 @@ def decide(db: Session, actor: Actor, case_id: uuid.UUID, decision: ReviewDecisi
         profile.revalidation_due_at = now + timedelta(days=30 * s.KYC_REVALIDATION_MONTHS)
         profile.has_background_check_badge = any(
             d.status == D.APPROVED and d.document_type.category == DocumentCategory.BACKGROUND_CHECK for d in docs)
+        # Reaprobado tras una suspensión o un vencimiento: su cuenta de pagos vuelve a poder cobrar.
+        from app.payments.accounts import unblock_for_kyc
+        unblock_for_kyc(db, profile.technician_id)
     db.flush()
     return profile
 
@@ -302,6 +305,7 @@ def decide(db: Session, actor: Actor, case_id: uuid.UUID, decision: ReviewDecisi
 def suspend(db: Session, actor: Actor, case_id: uuid.UUID, reason_code: str, note: str | None,
             ctx: RequestContext | None = None) -> KycProfile:
     from app.orders.service import release_technician_orders
+    from app.payments.accounts import block_for_kyc
 
     _need(actor, Permission.KYC_SUSPEND, ctx)
     profile = _lock_profile(db, case_id)
@@ -309,6 +313,7 @@ def suspend(db: Session, actor: Actor, case_id: uuid.UUID, reason_code: str, not
     reason = _reason(db, reason_code, ReasonScope.SUSPENSION, note)
     transition(db, profile.id, S.SUSPENDED, actor, reason_code=reason.code, note=note, ctx=ctx)
     release_technician_orders(db, profile.technician_id, "TECHNICIAN_SUSPENDED")
+    block_for_kyc(db, profile.technician_id, "KYC_SUSPENDED")
     return profile
 
 
@@ -350,6 +355,7 @@ def release_stale_claims(db: Session, now: datetime | None = None) -> int:
 def expire_approvals(db: Session, now: datetime | None = None) -> int:
     """APPROVED con identificación vencida o revalidación cumplida → EXPIRED (deja de recibir órdenes)."""
     from app.orders.service import release_technician_orders
+    from app.payments.accounts import block_for_kyc
 
     now = now or _now()
     rows = db.scalars(select(KycProfile).where(
@@ -363,6 +369,7 @@ def expire_approvals(db: Session, now: datetime | None = None) -> int:
             with db.begin_nested():          # un caso que cambió de estado a la vez no aborta el lote
                 transition(db, p.id, S.EXPIRED, Actor.system(), reason_code="DOCUMENTO_OBLIGATORIO_VENCIDO")
                 release_technician_orders(db, p.technician_id, "TECHNICIAN_KYC_EXPIRED")
+                block_for_kyc(db, p.technician_id, "KYC_EXPIRED")
             done += 1
         except KycTransitionError:
             continue

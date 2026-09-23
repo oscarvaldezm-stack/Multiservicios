@@ -114,6 +114,15 @@ def _seed_key_metadata(conn) -> None:
         ), {"p": purpose, "k": key_id, "fp": key_fingerprint(_b64_key(raw.get_secret_value(), purpose))})
 
 
+@pytest.fixture(autouse=True)
+def _reset_fake_provider():
+    """El proveedor falso vive en memoria durante todo el proceso: se vacía entre pruebas."""
+    from app.payments.providers import get_provider
+
+    get_provider().reset()
+    yield
+
+
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)

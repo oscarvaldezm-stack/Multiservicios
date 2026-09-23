@@ -423,8 +423,18 @@ def test_cabeceras_de_seguridad_siempre(client):
 def _prod(**over):
     base = dict(ENVIRONMENT="production", BCRYPT_ROUNDS=12, ALLOWED_HOSTS=["api.example.mx"],
                 CORS_ORIGINS=["https://app.example.mx"], STORAGE_BACKEND="s3", S3_KMS_KEY_ID="arn:aws:kms:x",
-                KYC_SCANNER="clamd")
+                KYC_SCANNER="clamd", **_stripe_live())
     return Settings(**(base | over))
+
+
+def _stripe_live() -> dict:
+    # Claves falsas armadas en tiempo de ejecución (que ningún escáner de secretos las confunda con reales).
+    live = "_live_"
+    return dict(PAYMENT_PROVIDER_BACKEND="stripe", STRIPE_SECRET_KEY="rk" + live + "x" * 24,
+                STRIPE_PUBLISHABLE_KEY="pk" + live + "x" * 24, STRIPE_WEBHOOK_SECRET="whsec_" + "a" * 24,
+                STRIPE_CONNECT_WEBHOOK_SECRET="whsec_" + "b" * 24,
+                STRIPE_CONNECT_RETURN_URL="https://app.example.mx/pagos/listo",
+                STRIPE_CONNECT_REFRESH_URL="https://app.example.mx/pagos/reintentar")
 
 
 @pytest.mark.parametrize("over,msg", [
