@@ -125,18 +125,111 @@ class OrderStatus(str, enum.Enum):
 
 
 class PaymentStatus(str, enum.Enum):
-    PENDING = "PENDING"                        # intención creada, sin autorizar
-    AUTHORIZED = "AUTHORIZED"                  # fondos retenidos en la tarjeta (al salir el técnico)
-    CAPTURED = "CAPTURED"                      # cobrado y en custodia de la plataforma = pago confirmado
-    RELEASED = "RELEASED"                      # transferido al técnico
+    """
+    Estado del pago según el proveedor (módulo de pagos, sección 5). Solo lo cambia
+    app/payments/state_machine.py al procesar un evento verificado o tras una llamada
+    confirmada al proveedor; ningún endpoint recibe un estado.
+    """
+
+    PENDING = "PENDING"                        # creado; falta método o confirmación
+    REQUIRES_ACTION = "REQUIRES_ACTION"        # 3D Secure u otra acción del cliente
+    PROCESSING = "PROCESSING"                  # el proveedor lo está procesando
+    AUTHORIZED = "AUTHORIZED"                  # monto reservado en la tarjeta, sin cobrar
+    PAID = "PAID"                              # cobrado; la división ya se aplicó
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"                    # reserva liberada (cancelación o vencimiento)
     PARTIALLY_REFUNDED = "PARTIALLY_REFUNDED"
     REFUNDED = "REFUNDED"
+    DISPUTED = "DISPUTED"                      # contracargo abierto
+    CHARGED_BACK = "CHARGED_BACK"              # contracargo perdido
+
+
+# Estados de pago que cuentan como "pago confirmado" para calificar (sección 11 del doc de pagos).
+PAYMENT_CONFIRMED = frozenset({PaymentStatus.PAID, PaymentStatus.PARTIALLY_REFUNDED})
+
+
+class PaymentKind(str, enum.Enum):
+    SERVICE = "SERVICE"                        # el cobro principal de la orden (uno activo por orden)
+    ADJUSTMENT = "ADJUSTMENT"                  # trabajo adicional aprobado por el cliente
+    CANCELLATION_FEE = "CANCELLATION_FEE"
+
+
+class CommissionScope(str, enum.Enum):
+    """Orden de precedencia al elegir la regla: PROMOTION → TECHNICIAN → CATEGORY → GLOBAL."""
+
+    PROMOTION = "PROMOTION"
+    TECHNICIAN = "TECHNICIAN"
+    CATEGORY = "CATEGORY"
+    GLOBAL = "GLOBAL"
+
+
+class CommissionType(str, enum.Enum):
+    PERCENT = "PERCENT"
+    FIXED = "FIXED"
+    PERCENT_PLUS_FIXED = "PERCENT_PLUS_FIXED"
+
+
+class LedgerAccount(str, enum.Enum):
+    """Cuentas del libro de partida doble. Signo: + abono (se le debe / ingresa), − cargo."""
+
+    CUSTOMER = "CUSTOMER"                      # lo que paga (−) o recupera (+) el cliente
+    TECHNICIAN_PAYABLE = "TECHNICIAN_PAYABLE"  # lo que se le debe al técnico
+    PLATFORM_REVENUE = "PLATFORM_REVENUE"      # comisión de la plataforma
+    VAT_PAYABLE = "VAT_PAYABLE"                # IVA trasladado de la comisión
+    TAX_WITHHELD = "TAX_WITHHELD"              # retenciones de ISR e IVA al técnico
+    PROVIDER_FEES = "PROVIDER_FEES"            # comisión del proveedor de pagos
+    REFUNDS = "REFUNDS"                        # reembolsos pendientes de asignar a quien los absorbe
+
+
+class PaymentTransactionType(str, enum.Enum):
+    AUTHORIZATION = "AUTHORIZATION"
+    CAPTURE = "CAPTURE"
+    CANCEL = "CANCEL"
+    REFUND = "REFUND"
+    TRANSFER_REVERSAL = "TRANSFER_REVERSAL"
+
+
+class PaymentAccountStatus(str, enum.Enum):
+    """Cuenta de pagos (cuenta conectada) del técnico; sección 4 del doc de pagos."""
+
+    NOT_CREATED = "NOT_CREATED"
+    ONBOARDING = "ONBOARDING"
+    PENDING_VERIFICATION = "PENDING_VERIFICATION"
+    ENABLED = "ENABLED"
+    RESTRICTED = "RESTRICTED"
+    DISABLED = "DISABLED"
+
+
+class RefundStatus(str, enum.Enum):
+    REQUESTED = "REQUESTED"
+    APPROVED = "APPROVED"
+    PENDING = "PENDING"                        # enviado al proveedor
+    SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
-    CANCELED = "CANCELED"                      # autorización anulada (orden cancelada)
+    REJECTED = "REJECTED"
 
 
-# Estados de pago que cuentan como "pago confirmado" para calificar.
-PAYMENT_CONFIRMED = frozenset({PaymentStatus.CAPTURED, PaymentStatus.RELEASED, PaymentStatus.PARTIALLY_REFUNDED})
+class DisputeStatus(str, enum.Enum):
+    NEEDS_RESPONSE = "NEEDS_RESPONSE"
+    UNDER_REVIEW = "UNDER_REVIEW"
+    WON = "WON"
+    LOST = "LOST"
+
+
+class PayoutStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    IN_TRANSIT = "IN_TRANSIT"
+    PAID = "PAID"
+    FAILED = "FAILED"
+    CANCELED = "CANCELED"
+
+
+class WebhookEventStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    PROCESSED = "PROCESSED"
+    IGNORED = "IGNORED"                        # evento viejo o sin efecto
+    FAILED = "FAILED"                          # se reintentará
+    DEAD = "DEAD"                              # agotó los reintentos: alerta a finanzas
 
 
 class ReviewStatus(str, enum.Enum):

@@ -74,7 +74,8 @@ def assess(db: Session, client: User, order: ServiceOrder, payment: Payment, *, 
 
     if client.created_at and now - client.created_at < timedelta(days=7):
         flags.add("NEW_CLIENT_ACCOUNT")
-    if payment.amount < Decimal(str(s.REVIEW_MIN_ORDER_AMOUNT)):
+    # Precio del servicio sin IVA (el que acordaron), no el cobro con impuestos.
+    if order.agreed_price is None or order.agreed_price < Decimal(str(s.REVIEW_MIN_ORDER_AMOUNT)):
         flags.add("LOW_VALUE_ORDER")
     burst = db.scalar(select(func.count()).select_from(Review).where(
         Review.technician_id == tech_id, Review.created_at >= now - timedelta(hours=24)))

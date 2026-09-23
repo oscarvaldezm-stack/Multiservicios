@@ -134,7 +134,7 @@ def test_reembolso_total_bloquea_y_oculta_la_resena_existente(client, db, ready)
     oid, (tid, _, _, ch) = ready
     rid = review(client, ch, oid, 1, comment="Nunca terminó el trabajo").json()["id"]
     from tests.marketplace import payment_of
-    webhook(db, oid, "refunded", amount=payment_of(db, oid).amount)
+    webhook(db, oid, "refunded", amount=payment_of(db, oid).captured_cents)
     assert order_status(db, oid) == "REFUNDED"
     assert db_review(db, rid).status == ReviewStatus.HIDDEN
     assert db.get(TechnicianReputation, tid).verified_reviews == 0
@@ -602,7 +602,7 @@ def test_resena_de_orden_reembolsada_no_se_republica_al_resolver_reportes(client
         client.post(f"{REVIEWS}/{rid}/report", headers=h, json={"reason": "FALSE"})
     assert db_review(db, rid).status == ReviewStatus.HIDDEN
     from tests.marketplace import payment_of
-    webhook(db, oid, "refunded", amount=payment_of(db, oid).amount)
+    webhook(db, oid, "refunded", amount=payment_of(db, oid).captured_cents)
     rev = db_review(db, rid)
     assert rev.moderation_reason == "ORDER_REFUNDED" and rev.weight == 0
     mod = admin_h(client, db, "mod@example.com", AdminRole.CONTENT_MODERATOR)

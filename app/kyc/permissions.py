@@ -37,6 +37,8 @@ class Permission(str, enum.Enum):
     REVIEWS_MODERATE = "reviews:moderate"          # ocultar y resolver reportes (sin revertir decisiones)
     REVIEWS_PUBLISH = "reviews:publish"            # publicar / liberar retenidas / decidir el peso en la reputación
     REVIEWS_REMOVE = "reviews:remove"              # eliminar (decisión final)
+    # Pagos (Fase 1)
+    COMMISSION_RULES_MANAGE = "finance:commission_rules:manage"   # crear y cerrar reglas de comisión
 
 
 P = Permission
@@ -60,7 +62,7 @@ ROLE_PERMISSIONS: dict[AdminRole, frozenset[Permission]] = {
     # Roles de finanzas: sin permisos KYC; resuelven disputas de dinero.
     AdminRole.FINANCE_VIEWER: frozenset({P.ORDERS_READ}),
     AdminRole.FINANCE_OPERATOR: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE}),
-    AdminRole.FINANCE_ADMIN: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE}),
+    AdminRole.FINANCE_ADMIN: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE, P.COMMISSION_RULES_MANAGE}),
     # Moderación de contenido: única que puede PUBLICAR (revertir un ocultamiento) y ELIMINAR reseñas (la bitácora de cada reseña va en su detalle).
     AdminRole.CONTENT_MODERATOR: frozenset({P.REVIEWS_READ, P.REVIEWS_MODERATE, P.REVIEWS_PUBLISH,
                                             P.REVIEWS_REMOVE}),

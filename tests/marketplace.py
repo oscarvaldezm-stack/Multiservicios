@@ -8,6 +8,7 @@ from sqlalchemy import select, text
 
 from app.models import KycStatus, Payment, ServiceOrder, User
 from app.payments import service as payments
+from app.payments.commission import to_cents
 from tests.conftest import API, auth, drive_to, login, register, verify_email
 
 ORDERS = f"{API}/orders"
@@ -75,7 +76,8 @@ def webhook(db, order_id, event: str, **kw) -> None:
     elif event == "failed":
         payments.mark_failed(db, p, "card_declined")
     elif event == "refunded":
-        payments.mark_refunded(db, p, kw["amount"])
+        amount = kw["amount"]          # centavos (int) o pesos (Decimal / str)
+        payments.mark_refunded(db, p, amount if isinstance(amount, int) else to_cents(amount))
     db.commit()
     db.expire_all()
 

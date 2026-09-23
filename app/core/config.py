@@ -95,6 +95,26 @@ class Settings(BaseSettings):
     ORDER_DISPUTE_WINDOW_DAYS: int = Field(default=7, ge=1)    # después del pago
     ORDER_MAX_OPEN_PER_CLIENT: int = Field(default=5, ge=1)       # solicitudes abiertas a la vez (antispam)
 
+    # --- Pagos (Fase 1: montos, impuestos y costo del proveedor) -------------------------
+    # Todas las tasas en puntos base (1600 = 16 %). Decisión D6: el precio acordado va SIN IVA;
+    # al cliente se le cobra precio + IVA, y al técnico se le retienen ISR e IVA.
+    # Las retenciones las debe validar el contador (tasas 2026 para plataformas digitales).
+    PAYMENT_PROVIDER: str = Field(default="stripe", min_length=1, max_length=30)
+    PAYMENT_CURRENCY: str = Field(default="MXN", pattern=r"^[A-Z]{3}$")
+    TAX_IVA_BP: int = Field(default=1600, ge=0, le=10000)                  # IVA del servicio y de la comisión
+    WITHHOLDING_ISR_BP: int = Field(default=250, ge=0, le=10000)           # técnico con RFC
+    WITHHOLDING_IVA_BP: int = Field(default=800, ge=0, le=10000)
+    WITHHOLDING_ISR_NO_RFC_BP: int = Field(default=2000, ge=0, le=10000)   # técnico sin RFC
+    WITHHOLDING_IVA_NO_RFC_BP: int = Field(default=1600, ge=0, le=10000)
+    # Costo estimado del proveedor (tarjeta nacional, más IVA). Verificar la tarifa vigente.
+    PROVIDER_FEE_RATE_BP: int = Field(default=360, ge=0, le=10000)
+    PROVIDER_FEE_FIXED_CENTS: int = Field(default=300, ge=0)
+    # Rango de precios admitido; una regla de comisión debe cubrir el costo del proveedor en todo el rango.
+    PAYMENT_MIN_SERVICE_CENTS: int = Field(default=5_000, ge=1)            # $50
+    PAYMENT_MAX_SERVICE_CENTS: int = Field(default=50_000_000, ge=1)       # $500,000
+    # Vigencia de una autorización con tarjeta guardada (Visa, sin el cliente presente: ~4 d 18 h).
+    PAYMENT_AUTHORIZATION_VALID_HOURS: int = Field(default=114, ge=1, le=24 * 30)
+
     # --- Reseñas -------------------------------------------------------------------------
     REVIEW_WINDOW_DAYS: int = Field(default=30, ge=1)          # para calificar después del pago
     REVIEW_EDIT_HOURS: int = Field(default=24, ge=1)
@@ -130,6 +150,12 @@ class Settings(BaseSettings):
                     self.KYC_BLIND_INDEX_KEY.get_secret_value(), self.INTEGRITY_KEY.get_secret_value()]
         if len(set(secrets_)) != len(secrets_):
             raise ValueError("JWT_SECRET_KEY, KYC_MASTER_KEY, KYC_BLIND_INDEX_KEY e INTEGRITY_KEY deben ser distintas")
+        return self
+
+    @model_validator(mode="after")
+    def _payment_range(self) -> "Settings":
+        if self.PAYMENT_MIN_SERVICE_CENTS >= self.PAYMENT_MAX_SERVICE_CENTS:
+            raise ValueError("PAYMENT_MIN_SERVICE_CENTS debe ser menor que PAYMENT_MAX_SERVICE_CENTS")
         return self
 
     @model_validator(mode="after")

@@ -25,7 +25,6 @@ from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.kyc.permissions import Permission
 from app.models import (
-    PAYMENT_CONFIRMED,
     OrderStatus,
     OutboxEvent,
     ReportReason,
@@ -42,7 +41,7 @@ from app.models import (
     UserRole,
 )
 from app.orders.state_machine import lock_order, transition
-from app.payments.service import active_payment
+from app.payments.service import active_payment, get_order_payment_summary
 from app.reviews import antifraud, integrity, reputation, signals
 from app.reviews.content import clean_text, is_offensive
 
@@ -99,8 +98,7 @@ def eligibility(db: Session, client: User, order: ServiceOrder) -> tuple[bool, s
     if order.status != O.READY_FOR_REVIEW:
         return False, "REVIEW_ORDER_NOT_COMPLETED" if order.status not in (O.COMPLETED, O.PAID) \
             else "REVIEW_PAYMENT_NOT_CONFIRMED"
-    payment = active_payment(db, order.id)
-    if payment is None or payment.status not in PAYMENT_CONFIRMED:
+    if not get_order_payment_summary(db, order.id).confirmed:
         return False, "REVIEW_PAYMENT_NOT_CONFIRMED"
     if order.paid_at is None:
         return False, "REVIEW_PAYMENT_NOT_CONFIRMED"

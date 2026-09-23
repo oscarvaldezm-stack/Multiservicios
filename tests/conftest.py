@@ -86,6 +86,18 @@ def _clean_tables():
         tables = ", ".join(f'"{n}"' for n in names if n not in SEEDED)  # nombres del catálogo del sistema
         conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
         _seed_key_metadata(conn)
+        _seed_commission_rule(conn)
+
+
+def _seed_commission_rule(conn) -> None:
+    """Deja la regla GLOBAL que siembra la migración 0006 (las pruebas de comisiones crean otras)."""
+    import importlib
+
+    mig = importlib.import_module("migrations.versions.0006_pagos_fase1_modelo_comisiones_y_ledger")
+    conn.execute(text(
+        "INSERT INTO commission_rules (scope, type, rate_bp, min_cents, valid_from, note) "
+        "VALUES ('GLOBAL', 'PERCENT', :r, :m, '2026-01-01T00:00:00Z', 'Regla global inicial (migración 0006)')"
+    ), {"r": mig.GLOBAL_RATE_BP, "m": mig.GLOBAL_MIN_CENTS})
 
 
 def _seed_key_metadata(conn) -> None:

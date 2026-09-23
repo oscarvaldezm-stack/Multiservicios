@@ -18,12 +18,7 @@ class ServiceCategory(TimestampMixin, Base):
     slug: Mapped[str] = mapped_column(String(80), unique=True, nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
-    # Comisión de la plataforma por categoría (ej. 0.1500 = 15 %)
-    commission_rate: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False, server_default=text("0.15"))
-
-    __table_args__ = (
-        CheckConstraint("commission_rate >= 0 AND commission_rate < 1", name="commission_rate_range"),
-    )
+    # La comisión ya no vive aquí: la definen las reglas de commission_rules (alcance CATEGORY).
 
 
 class TechnicianService(TimestampMixin, Base):

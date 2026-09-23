@@ -25,6 +25,7 @@ from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.orders.state_machine import PRE_START, OrderError, lock_order, transition
 from app.payments import service as payments
+from app.payments.commission import from_cents, to_cents
 from app.models import (
     PAYMENT_CONFIRMED,
     OrderStatus,
@@ -159,6 +160,12 @@ def accept(db: Session, technician: User, order_id: uuid.UUID, agreed_price: Dec
     profile = db.get(TechnicianProfile, technician.id)
     if profile is None or not profile.is_available:
         raise OrderError("Márcate disponible para aceptar servicios", code="TECHNICIAN_NOT_AVAILABLE")
+    s = get_settings()
+    price_cents = to_cents(agreed_price)
+    if not s.PAYMENT_MIN_SERVICE_CENTS <= price_cents <= s.PAYMENT_MAX_SERVICE_CENTS:
+        raise DomainError("El precio está fuera del rango admitido", code="ORDER_PRICE_OUT_OF_RANGE", http_status=422,
+                          extra={"min": str(from_cents(s.PAYMENT_MIN_SERVICE_CENTS)),
+                                 "max": str(from_cents(s.PAYMENT_MAX_SERVICE_CENTS))})
     order = lock_order(db, order_id)
     # Un técnico solo "ve" solicitudes abiertas de sus categorías (o reservadas a él).
     offers = db.get(TechnicianService, (technician.id, order.category_id)) if order else None
@@ -279,8 +286,9 @@ def resolve_dispute(db: Session, admin: Actor, order_id: uuid.UUID, outcome: str
     if order.status != O.DISPUTED:
         raise OrderError("La orden no está en disputa", code="ORDER_NOT_DISPUTED")
     payment = payments.active_payment(db, order.id, lock=True)
-    captured = payment is not None and payment.status in (PaymentStatus.CAPTURED, PaymentStatus.RELEASED,
-                                                          PaymentStatus.PARTIALLY_REFUNDED)
+    captured = payment is not None and payment.status in PAYMENT_CONFIRMED
+    refundable_cents = payment.captured_cents - payment.refunded_cents if captured else 0
+    refund_cents = to_cents(refund_amount) if refund_amount is not None else None
     has_review = db.scalar(select(func.count()).select_from(Review).where(Review.service_order_id == order.id)) > 0
     after_payment = O.REVIEWED if has_review else O.READY_FOR_REVIEW
 
@@ -293,16 +301,15 @@ def resolve_dispute(db: Session, admin: Actor, order_id: uuid.UUID, outcome: str
         else:
             raise OrderError("No hay un pago que liberar", code="ORDER_NO_PAYMENT")
     elif outcome == "PARTIAL_REFUND":
-        if not captured or refund_amount is None \
-                or not (0 < refund_amount < payment.amount - payment.amount_refunded):
+        if not captured or refund_cents is None or not (0 < refund_cents < refundable_cents):
             raise DomainError("El reembolso parcial requiere un pago cobrado y un monto menor a lo que queda por reembolsar",
                               code="ORDER_INVALID_REFUND", http_status=422)
-        db.add(_refund_request(payment.id, refund_amount))
+        db.add(_refund_request(payment.id, refund_cents))
         transition(db, order, after_payment, admin, reason_code="DISPUTE_PARTIAL_REFUND", note=note, ctx=ctx)
     elif outcome == "FULL_REFUND":
         if captured:
             # El reembolso lo confirma el proveedor (webhook) → la orden pasa a REFUNDED en ese momento.
-            db.add(_refund_request(payment.id, payment.amount - payment.amount_refunded))
+            db.add(_refund_request(payment.id, refundable_cents))
         else:
             payments.cancel_for_order(db, order)
             transition(db, order, O.CANCELLED, admin, reason_code="DISPUTE_FULL_REFUND", note=note, ctx=ctx)
@@ -317,10 +324,9 @@ def resolve_dispute(db: Session, admin: Actor, order_id: uuid.UUID, outcome: str
     return order
 
 
-def _refund_request(payment_id: uuid.UUID, amount: Decimal):
-    from app.models import OutboxEvent
+def _refund_request(payment_id: uuid.UUID, amount_cents: int) -> OutboxEvent:
     return OutboxEvent(event_type="payment.refund_requested", aggregate_type="payment", aggregate_id=payment_id,
-                       payload={"amount": str(amount)})
+                       payload={"amount_cents": amount_cents})
 
 
 # =============================================================================

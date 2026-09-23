@@ -1,6 +1,6 @@
 # Multiservicios API: Backend
 
-Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas).
+Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable).
 
 FastAPI · SQLAlchemy 2.0 · PostgreSQL · OAuth2 Password Flow + JWT · Passlib/bcrypt
 
@@ -35,7 +35,11 @@ app/
 │   └── scanner.py            # Antivirus ClamAV (INSTREAM), falla cerrado
 ├── storage/object_storage.py # Almacenamiento privado: local (dev) o S3 con SSE-KMS
 ├── orders/              # Máquina de estados de la orden y casos de uso (cliente, técnico, disputas, trabajos)
-├── payments/service.py  # Estados del pago (los cambia solo el webhook del proveedor)
+├── payments/
+│   ├── service.py       # Crear, anular y aplicar eventos del proveedor sobre un pago (nunca desde la app)
+│   ├── commission.py    # CommissionEngine: centavos, IVA, retenciones, reglas y costo del proveedor
+│   ├── state_machine.py # ALLOWED_PAYMENT_TRANSITIONS + move(): única vía para cambiar el estado del pago
+│   └── ledger.py        # Libro de partida doble (cada grupo de asientos suma cero)
 ├── reviews/             # Calificaciones: servicio, antifraude, reputación, firma de integridad, filtros de texto
 ├── audit/writer.py      # Auditoría con cadena de hashes y verify_chain()
 ├── schemas/auth.py      # Validación Pydantic (frontera de entrada/salida)
@@ -52,7 +56,7 @@ app/
 │       ├── orders.py          # /orders, /clients/me/orders, /technicians/me/jobs-feed, /admin/orders
 │       └── reviews.py         # /reviews, /technicians/{id}/reviews, /admin/reviews
 └── main.py              # App, CORS, TrustedHost, headers de seguridad
-migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones
+migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable
 scripts/
 ├── init_db.py           # Solo desarrollo: aplica migraciones y carga categorías
 ├── create_admin.py      # Único camino para crear administradores
@@ -61,7 +65,7 @@ scripts/
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
 worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
-tests/                   # 437 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+tests/                   # 506 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
@@ -618,3 +622,91 @@ Rutas listas para el panel: cola de expedientes y decisiones KYC (10.2), cola de
 - **Límites por conteo** (reseñas al día, reportes, solicitudes abiertas, casos tomados): con peticiones en paralelo pueden excederse por una o dos unidades; el límite duro por IP está en Nginx.
 - **`X-Device-Id`** lo envía la app: detecta el caso común (el mismo teléfono), no a alguien que lo falsifica. La huella de la tarjeta y el tope por cliente cubren ese caso.
 - El autor ve si su reseña está `PENDING_MODERATION` (transparencia hacia el usuario, a cambio de revelar que se retuvo).
+
+---
+
+## 11. Pagos, Fase 1: modelo de datos, motor de comisiones y libro contable
+
+Implementa la Fase 1 del documento "Módulo de pagos: Fase 0" con las decisiones del 23 de septiembre de 2026: **D1** Stripe, **D5** aprobación automática a las 72 h, **D6** precio sin IVA más IVA y retenciones con tasas configurables, **D7** autorizar cuando el técnico sale. Esta fase todavía **no habla con Stripe**: deja listas las tablas, las reglas y el cálculo sobre los que se montan las fases 2 a 7.
+
+### 11.1 Qué cambió
+
+- **Importes en centavos** (`BIGINT`): `payments.amount_cents`, `captured_cents`, `refunded_cents`. Nada de `float` ni de `Numeric` para dinero nuevo. El precio que acuerda el técnico (`service_orders.agreed_price`) se convierte a centavos de forma exacta; una fracción de centavo se rechaza en lugar de redondearse.
+- **Estados del pago** del doc: `PENDING`, `REQUIRES_ACTION`, `PROCESSING`, `AUTHORIZED`, `PAID`, `FAILED`, `CANCELLED`, `PARTIALLY_REFUNDED`, `REFUNDED`, `DISPUTED`, `CHARGED_BACK`. `CAPTURED` y `RELEASED` se convierten en `PAID` (con cargos de destino no hay una "liberación" aparte: Stripe transfiere al capturar). "Pago confirmado" para calificar = `PAID` o `PARTIALLY_REFUNDED`.
+- **Tipos de pago**: `SERVICE`, `ADJUSTMENT` (trabajo adicional) y `CANCELLATION_FEE`. Una orden puede tener varios pagos, pero solo un `SERVICE` activo (índice único parcial).
+- **La comisión sale de reglas**, no de la categoría: `service_categories.commission_rate` se migró a reglas `CATEGORY` (solo las distintas de 15 %) y desapareció.
+- **El reparto se congela** por pago en `commission_transactions`, con copia de la regla y de las tasas fiscales aplicadas.
+- **Libro contable** de partida doble en `ledger_entries`.
+- Tablas listas para las siguientes fases (sin lógica todavía): `technician_payment_accounts`, `payment_customers`, `payment_transactions`, `payment_refunds`, `payment_disputes`, `payouts`, `payment_webhook_events`, `idempotency_keys`, `cancellation_policies`. Ninguna tiene columnas para tarjeta, CVV, vencimiento ni CLABE.
+- Los pagos existentes se convierten al migrar: conservan su reparto en un desglose `LEGACY`.
+
+### 11.2 Cálculo (`app/payments/commission.py`)
+
+El frontend solo manda el id de la orden. El motor calcula en el backend, en centavos enteros:
+
+1. IVA del servicio sobre el precio acordado (sin IVA) → bruto = precio + IVA.
+2. Comisión según la regla (half-up al centavo), con mínimo y máximo, y nunca mayor que el precio.
+3. IVA de la comisión, retención de ISR y retención de IVA (half-up cada una).
+4. El técnico recibe el remanente exacto.
+
+Invariante (en código y en un `CHECK` de la base): técnico + comisión + IVA de la comisión + retenciones = bruto − descuento.
+
+| Concepto (servicio de $1,000, comisión 15 %, técnico con RFC) | Centavos |
+|---|---|
+| Precio / IVA 16 % / cobro al cliente | 100 000 / 16 000 / **116 000** |
+| Comisión / IVA de la comisión | 15 000 / 2 400 |
+| Retención ISR 2.5 % / retención IVA 8 % | 2 500 / 8 000 |
+| `application_fee_amount` (lo que retiene la plataforma) | **27 900** |
+| Recibe el técnico | **88 100** |
+
+Sin RFC las retenciones son 20 % de ISR y 16 % de IVA. Todas las tasas son variables de entorno (`TAX_IVA_BP`, `WITHHOLDING_*_BP`, en puntos base) y **debe validarlas tu contador**.
+
+**Qué regla se aplica:** promoción → técnico → categoría → global; gana la primera vigente en la fecha de la cotización. Hay una regla `GLOBAL` inicial de 15 % con mínimo de $10.
+
+**Reglas** (`create_rule` / `close_rule`, solo `FINANCE_ADMIN`, auditadas):
+- No se editan ni se borran: una regla nueva cierra la anterior del mismo alcance, y los pagos viejos conservan la suya. La base lo impone (trigger) y no permite dos reglas del mismo alcance con fechas traslapadas (`EXCLUDE` con `btree_gist`).
+- No pueden empezar en el pasado.
+- **Se rechaza una regla que dé pérdida**: si en algún precio del rango admitido (`PAYMENT_MIN_SERVICE_CENTS` a `PAYMENT_MAX_SERVICE_CENTS`, de $50 a $500,000) la comisión no cubre el costo estimado de Stripe (3.6 % + $3 + IVA sobre el cobro; configurable), responde `COMMISSION_BELOW_PROVIDER_COST` con el precio donde falla. Como comisión y costo son lineales por tramos, basta revisar los extremos y los quiebres (mínimo, máximo, tope del precio).
+- El técnico propone un precio fuera de ese rango → `422 ORDER_PRICE_OUT_OF_RANGE`.
+
+**Descuentos**: en esta fase solo los que paga la plataforma. Bajan la comisión con su IVA exactamente en el monto del descuento, así que el técnico recibe lo mismo; no pueden superar la comisión con su IVA (`application_fee_amount` no puede ser negativa). Los que absorbe el técnico necesitan que él acepte la promoción y quedan para una fase posterior.
+
+### 11.3 Máquina de estados del pago (`app/payments/state_machine.py`)
+
+Las transiciones del doc, más tres que hacían falta: `REQUIRES_ACTION` → `PROCESSING` / `AUTHORIZED` / `FAILED` / `CANCELLED` (el cliente completa o abandona 3D Secure), `AUTHORIZED` → `FAILED` (falla la captura) y `DISPUTED` → `PARTIALLY_REFUNDED` (disputa ganada sobre un pago con reembolso parcial). Un trigger repite la tabla y además impide cambiar orden, pagador, tipo, monto, moneda o proveedor, y que lo capturado o lo reembolsado disminuya. Una prueba verifica que la tabla de la app y la del trigger sean idénticas. Repetir un evento no hace nada.
+
+Al autorizar se guarda `capture_deadline` (`PAYMENT_AUTHORIZATION_VALID_HOURS`, 114 h por defecto: Visa sin el cliente presente). La salvaguarda que captura 24 h antes de que venza llega en la Fase 3.
+
+### 11.4 Libro contable (`app/payments/ledger.py`)
+
+Cada movimiento es un grupo de asientos que suma cero; la tabla es de solo inserción y un trigger diferido rechaza al confirmar cualquier grupo descuadrado, aunque se escriba por SQL directo. Signo: + abono, − cargo.
+
+| Evento | Asientos |
+|---|---|
+| Cobro (`PAID`) | `CUSTOMER` −cobro · `TECHNICIAN_PAYABLE` +técnico · `PLATFORM_REVENUE` +comisión · `VAT_PAYABLE` +IVA de la comisión · `TAX_WITHHELD` +retenciones |
+| Reembolso | `CUSTOMER` +monto · `REFUNDS` −monto |
+| Contracargo perdido | `CUSTOMER` +pendiente · `REFUNDS` −pendiente (tipo `CHARGEBACK`) |
+
+`REFUNDS` es provisional: quién absorbe cada reembolso (técnico, plataforma o ambos) se decide con la política de la Fase 5. `VAT_PAYABLE` se agregó a las cuentas del doc porque el IVA de la comisión no es ingreso de la plataforma.
+
+### 11.5 Integración con órdenes y reseñas
+
+- La intención de pago se crea al agendar (`SCHEDULED`) con el monto del motor; el técnico solo inicia con el pago `AUTHORIZED`; al cobrarse, la orden pasa a `PAID` → `READY_FOR_REVIEW`.
+- Las reseñas preguntan a `payments.get_order_payment_summary(order_id)`, la única lectura que expone el módulo de pagos; el trigger de reseñas exige un pago `SERVICE` en `PAID` o `PARTIALLY_REFUNDED`.
+- La señal antifraude de orden barata compara el precio sin IVA.
+- Un contracargo (`DISPUTED`, `CHARGED_BACK`) todavía no mueve la orden ni afecta al técnico: eso es la Fase 5.
+
+### 11.6 Pruebas
+
+`tests/test_payments_commission.py` (cálculo puro: redondeo half-up, ejemplo del doc, sin RFC, mínimo, máximo y tope, 3,000 combinaciones aleatorias que siempre cuadran al centavo, descuentos, costo del proveedor y reglas que dan pérdida) y `tests/test_payments_db.py` (precedencia de reglas, cierre y programación, validaciones y permisos, auditoría, triggers de reglas, desglose y pago, un solo pago activo, asientos del cobro, reembolsos y contracargos, eventos repetidos).
+
+### 11.7 Siguiente: Fase 2 de pagos
+
+Configuración segura de Stripe (claves restringidas, separación prueba/producción), `PaymentProvider` + `StripePaymentProvider` en modo prueba, alta del técnico con cuenta conectada (solo con KYC aprobado) y guardado de tarjeta con SetupIntent.
+
+### 11.8 Limitaciones conocidas
+
+- **Captura parcial** (cargo por visita, servicio parcial) y pagos `ADJUSTMENT`: el modelo los admite, la lógica llega en las fases 3 y 5. Hoy la captura es siempre por el total.
+- **Comisión de Stripe real**: el costo del proveedor es una estimación configurable; el asiento `PROVIDER_FEES` se registra cuando la Fase 4 lea la transacción de saldo de Stripe.
+- **Revisión fiscal y legal**: tasas de retención, quién emite el CFDI al cliente y si el modelo requiere licencia bajo la Ley Fintech están pendientes de validar con contador y abogado.
+- El downgrade de la migración 0006 se niega si hay pagos (perdería el desglose).

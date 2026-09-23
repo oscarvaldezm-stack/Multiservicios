@@ -8,7 +8,7 @@ from sqlalchemy import select, text
 from app.models import AdminRole, OrderStatusHistory, PaymentStatus
 from app.orders import service as orders
 from app.orders.state_machine import ALLOWED_TRANSITIONS
-from app.payments.service import ALLOWED_PAYMENT_TRANSITIONS
+from app.payments.state_machine import ALLOWED_PAYMENT_TRANSITIONS
 from tests.conftest import API, auth, login, make_admin, register
 from tests.marketplace import (
     ORDERS,
@@ -39,7 +39,8 @@ def test_transiciones_de_la_app_y_del_trigger_coinciden():
     mig = importlib.import_module("migrations.versions.0005_ordenes_resenas_y_decisiones_kyc")
     app_pairs = {f"{a.value}>{b.value}" for a, b in ALLOWED_TRANSITIONS}
     assert app_pairs == set(mig.ORDER_TRANSITIONS)
-    assert {f"{a.value}>{b.value}" for a, b in ALLOWED_PAYMENT_TRANSITIONS} == set(mig.PAYMENT_TRANSITIONS)
+    pagos = importlib.import_module("migrations.versions.0006_pagos_fase1_modelo_comisiones_y_ledger")
+    assert {f"{a.value}>{b.value}" for a, b in ALLOWED_PAYMENT_TRANSITIONS} == set(pagos.PAYMENT_TRANSITIONS)
 
 
 # ------------------------------------------------------------------ flujo feliz
@@ -48,7 +49,9 @@ def test_flujo_completo_hasta_calificable(client, db, category, people):
     oid = run_order(client, db, ch, th, category)
     assert order_status(db, oid) == "READY_FOR_REVIEW"
     p = payment_of(db, oid)
-    assert p.status == PaymentStatus.CAPTURED and p.platform_fee + p.technician_payout == p.amount
+    assert p.status == PaymentStatus.PAID and p.captured_cents == p.amount_cents
+    b = p.breakdown
+    assert b.technician_cents + b.application_fee_cents == p.amount_cents
     history = [h.to_status.value for h in db.scalars(select(OrderStatusHistory).where(
         OrderStatusHistory.order_id == uuid.UUID(oid)).order_by(OrderStatusHistory.id))]
     assert history == ["ACCEPTED", "SCHEDULED", "IN_PROGRESS", "AWAITING_APPROVAL", "COMPLETED", "PAID",
@@ -168,7 +171,7 @@ def test_cliente_cancela_antes_de_iniciar_y_se_anula_el_pago(client, db, categor
     from app.models import Payment
     db.expire_all()
     p = db.scalar(select(Payment).where(Payment.service_order_id == uuid.UUID(oid)))
-    assert p.status == PaymentStatus.CANCELED
+    assert p.status == PaymentStatus.CANCELLED and p.cancelled_at is not None
 
 
 def test_tecnico_se_retira_y_cuenta_en_su_confiabilidad(client, db, category, people):
@@ -207,12 +210,24 @@ def test_eventos_repetidos_son_idempotentes(client, db, category, people):
     assert order_status(db, oid) == "READY_FOR_REVIEW"
 
 
-def test_split_con_comision_de_la_categoria(client, db, category, people):
+def test_cobro_y_reparto_con_la_regla_global(client, db, category, people):
+    """Ejemplo del doc de pagos: $1,000 + IVA, comisión 15 %, técnico con RFC."""
     _, th, _, ch = people
     oid = run_order(client, db, ch, th, category, until="SCHEDULED", price="1000.00")
     p = payment_of(db, oid)
-    assert p.amount == Decimal("1000.00")
-    assert p.platform_fee == (Decimal("1000.00") * Decimal(category.commission_rate)).quantize(Decimal("0.01"))
+    assert p.amount_cents == 116_000
+    b = p.breakdown
+    assert (b.price_cents, b.service_tax_cents, b.commission_cents, b.commission_tax_cents,
+            b.withholding_isr_cents, b.withholding_iva_cents) == (100_000, 16_000, 15_000, 2_400, 2_500, 8_000)
+    assert b.application_fee_cents == 27_900 and b.technician_cents == 88_100
+    assert b.rule_scope == "GLOBAL" and b.technician_has_rfc
+
+
+def test_precio_fuera_de_rango_se_rechaza(client, db, category, people):
+    _, th, _, ch = people
+    oid = create_order(client, ch, category)["id"]
+    r = client.post(f"{ORDERS}/{oid}/accept", headers=th, json={"agreed_price": "10.00"})
+    assert r.status_code == 422 and err(r) == "ORDER_PRICE_OUT_OF_RANGE"
 
 
 def test_monto_del_pago_no_se_altera_por_sql(client, db, category, people):
@@ -220,9 +235,9 @@ def test_monto_del_pago_no_se_altera_por_sql(client, db, category, people):
     oid = run_order(client, db, ch, th, category, until="SCHEDULED")
     from sqlalchemy.exc import DBAPIError
     with pytest.raises(DBAPIError) as exc:
-        db.execute(text("UPDATE payments SET amount = 1 WHERE service_order_id = :id"), {"id": oid})
+        db.execute(text("UPDATE payments SET amount_cents = 1 WHERE service_order_id = :id"), {"id": oid})
     db.rollback()
-    assert "PAYMENT_IMMUTABLE" in str(exc.value.orig) or "split_matches_amount" in str(exc.value.orig)
+    assert "PAYMENT_IMMUTABLE" in str(exc.value.orig)
 
 
 # ------------------------------------------------------------------ disputas
@@ -254,7 +269,7 @@ def test_disputa_con_reembolso_total_no_es_calificable(client, db, category, peo
     r = client.post(f"{API}/admin/orders/{oid}/dispute-resolution", headers=fin,
                     json={"outcome": "FULL_REFUND", "note": "El técnico no se presentó"})
     assert r.status_code == 200 and r.json()["status"] == "DISPUTED"      # espera la confirmación del proveedor
-    webhook(db, oid, "refunded", amount=payment_of(db, oid).amount)
+    webhook(db, oid, "refunded", amount=payment_of(db, oid).captured_cents)
     assert order_status(db, oid) == "REFUNDED"
     from app.models import TechnicianReputation
     db.expire_all()
