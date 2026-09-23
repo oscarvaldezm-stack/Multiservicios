@@ -1,0 +1,77 @@
+"""Importar todos los modelos aquí para que Base.metadata (y Alembic) los conozca."""
+from app.models.auth import RefreshToken
+from app.models.catalog import ServiceCategory, TechnicianService
+from app.models.enums import (
+    ActorType,
+    AdminRole,
+    AuditResult,
+    DocumentCategory,
+    DocumentDecision,
+    DocumentSide,
+    KeyPurpose,
+    KeyStatus,
+    KycDocumentStatus,
+    KycStatus,
+    PAYMENT_CONFIRMED,
+    OrderStatus,
+    PaymentStatus,
+    ReportReason,
+    ReportResolution,
+    ReportStatus,
+    ReviewCategory,
+    ReviewStatus,
+    SignalKind,
+    ReasonScope,
+    RetentionAction,
+    ReviewDecision,
+    ScanStatus,
+    UserRole,
+)
+from app.models.kyc import (
+    AdminRegionScope,
+    AdminRoleAssignment,
+    AuditLog,
+    Consent,
+    Country,
+    DocumentType,
+    EncryptionKeyMetadata,
+    FileViewTicket,
+    KycAddress,
+    KycDocument,
+    KycDocumentFile,
+    KycDocumentReview,
+    KycProfile,
+    KycReview,
+    KycStatusHistory,
+    MxMunicipality,
+    MxPostalSettlement,
+    MxState,
+    OutboxEvent,
+    RejectionReason,
+    RetentionPolicy,
+)
+from app.models.reviews import (
+    VERIFIED_SERVICE,
+    Review,
+    ReviewAuditLog,
+    ReviewRating,
+    ReviewReport,
+    TechnicianReputation,
+    UserSignal,
+)
+from app.models.service import OrderStatusHistory, Payment, ServiceOrder
+from app.models.user import ClientProfile, TechnicianProfile, User
+
+__all__ = [
+    "ActorType", "AdminRegionScope", "AdminRole", "AdminRoleAssignment", "AuditLog", "AuditResult",
+    "ClientProfile", "Consent", "Country", "DocumentCategory", "DocumentDecision", "DocumentSide",
+    "DocumentType", "EncryptionKeyMetadata", "FileViewTicket", "KeyPurpose", "KeyStatus", "KycAddress", "KycDocument", "KycDocumentFile", "KycDocumentReview",
+    "KycDocumentStatus", "KycProfile", "KycReview", "KycStatus", "KycStatusHistory", "MxMunicipality",
+    "MxPostalSettlement", "MxState", "OutboxEvent", "Payment", "PaymentStatus", "ReasonScope",
+    "RefreshToken", "RejectionReason", "RetentionAction", "RetentionPolicy", "Review", "ReviewDecision",
+    "ScanStatus", "ServiceCategory", "ServiceOrder", "OrderStatus", "OrderStatusHistory", "TechnicianProfile",
+    "PAYMENT_CONFIRMED", "ReportReason", "ReportResolution", "ReportStatus", "ReviewCategory", "ReviewStatus",
+    "SignalKind", "VERIFIED_SERVICE", "ReviewAuditLog", "ReviewRating", "ReviewReport", "TechnicianReputation",
+    "UserSignal",
+    "TechnicianService", "User", "UserRole",
+]
