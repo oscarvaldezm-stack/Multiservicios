@@ -1,6 +1,6 @@
 # Multiservicios API: Backend
 
-Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa).
+Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa; Fase 4: webhooks, worker y conciliación).
 
 FastAPI · SQLAlchemy 2.0 · PostgreSQL · OAuth2 Password Flow + JWT · Passlib/bcrypt
 
@@ -43,6 +43,8 @@ app/
 │   ├── accounts.py      # Cuenta de pagos del técnico: alta, formulario de Stripe, estado, bloqueos
 │   ├── customers.py     # Cliente en Stripe y guardado de tarjeta (SetupIntent)
 │   ├── idempotency.py   # Encabezado Idempotency-Key de los POST de pagos
+│   ├── webhooks.py      # Bandeja de webhooks y su worker (re-consulta al proveedor, reintentos)
+│   ├── reconciliation.py # Conciliación diaria con el proveedor
 │   └── providers/       # Contrato PaymentProvider, adaptador de Stripe y proveedor falso
 ├── reviews/             # Calificaciones: servicio, antifraude, reputación, firma de integridad, filtros de texto
 ├── audit/writer.py      # Auditoría con cadena de hashes y verify_chain()
@@ -59,7 +61,8 @@ app/
 │       ├── admin_kyc_decisions.py # Tomar casos, decidir documentos y expedientes, suspender
 │       ├── orders.py          # /orders, /clients/me/orders, /technicians/me/jobs-feed, /admin/orders
 │       ├── reviews.py         # /reviews, /technicians/{id}/reviews, /admin/reviews
-│       └── payments.py        # /technicians/me/payment-account, /clients/me/payment-methods
+│       ├── payments.py        # /technicians/me/payment-account, /clients/me/payment-methods
+│       └── webhooks.py        # /webhooks/stripe y /webhooks/stripe-connect (firma, sin JWT)
 └── main.py              # App, CORS, TrustedHost, headers de seguridad
 migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico, 0008 autorización y regla crítica ampliada
 scripts/
@@ -68,9 +71,9 @@ scripts/
 ├── load_sepomex.py      # Carga el catálogo oficial de códigos postales
 └── rotate_keys.py       # Estado, activación, re-envoltura, revocación y re-key de llaves
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
-worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas, captura de pagos
+worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas, captura de pagos, webhooks, conciliación
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
-tests/                   # 598 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+tests/                   # 635 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
@@ -874,3 +877,76 @@ Todo cambio de estado que viene de Stripe (respuesta a una llamada o, en la Fase
 - **Captura parcial** (cargo por visita, servicio parcial) y pagos `ADJUSTMENT`: Fase 5.
 - **Webhooks:** hasta la Fase 4, los cambios que ocurren en Stripe sin una llamada nuestra (p. ej. el cliente completa 3D Secure) se ven al consultar (`refresh`) o en la siguiente acción.
 - **OXXO y SPEI** quedan fuera (D3): solo tarjetas, que admiten captura manual.
+
+---
+
+## 14. Pagos, Fase 4: webhooks, worker y conciliación
+
+### 14.1 Recepción (`app/api/routes/webhooks.py`)
+
+| Ruta | Secreto | Eventos que se configuran en Stripe |
+|---|---|---|
+| `POST /api/v1/webhooks/stripe` | `STRIPE_WEBHOOK_SECRET` | `payment_intent.requires_action`, `.processing`, `.amount_capturable_updated`, `.succeeded`, `.payment_failed`, `.canceled`; `charge.refunded`, `refund.updated`, `refund.failed`, `charge.dispute.*` (se guardan para la Fase 5) |
+| `POST /api/v1/webhooks/stripe-connect` | `STRIPE_CONNECT_WEBHOOK_SECRET` | `account.updated`, `account.application.deauthorized`, `payout.created`, `payout.paid`, `payout.failed` |
+
+Sin JWT: se autentican con la firma `Stripe-Signature`.
+
+1. Se lee el **cuerpo crudo** (la firma se calcula sobre los bytes exactos), con un tope de 512 KB (413 si se pasa).
+2. Se verifica la firma con el secreto **de ese endpoint** y una tolerancia de **5 minutos** (bloquea replays). Firma inválida, ausente, de otro endpoint, vieja o sobre un cuerpo alterado → **400** `WEBHOOK_SIGNATURE_INVALID`, registro en el log de seguridad y nada más.
+3. `INSERT ... ON CONFLICT (provider, provider_event_id) DO NOTHING`: un evento repetido responde 200 con `duplicate: true` sin reprocesarse.
+4. **200 de inmediato**; el procesamiento lo hace el worker.
+
+Del evento se guarda lo mínimo (id, tipo, id y tipo del objeto, cuenta conectada, modo): **nada** de correos, nombres ni datos de facturación que Stripe incluye en el objeto.
+
+### 14.2 Procesamiento (`app/payments/webhooks.py`, trabajo `payments.process_webhooks`)
+
+- Toma eventos pendientes con `FOR UPDATE SKIP LOCKED` (varias réplicas del worker no chocan).
+- **No confía en el evento:** vuelve a consultar el objeto al proveedor y aplica ese estado. Un evento falsificado que pasara la firma, o uno viejo que llegara tarde, no puede dejar un estado incorrecto.
+- Un evento cuyo modo (prueba/producción) no coincide con las claves se ignora y queda en el log de seguridad.
+
+| Evento | Qué hace |
+|---|---|
+| `payment_intent.*` | Consulta el cobro y lo aplica con `apply_provider_state` (la misma vía que la respuesta de una llamada). Busca el pago por el id del cobro o por el `payment_id` que se guardó en su metadata al autorizar |
+| `account.updated` | Sincroniza la cuenta del técnico (estado, requisitos, nombre) |
+| `account.application.deauthorized` | Bloquea la cuenta (`PROVIDER_DEAUTHORIZED`) y el técnico suelta sus órdenes no iniciadas |
+| `payout.*` | Consulta el depósito en la cuenta conectada y lo guarda en `payouts`; si falla (casi siempre una CLABE inválida), avisa al técnico |
+| Reembolsos y disputas | Se guardan como `IGNORED` con `DEFERRED_PHASE_5`; una disputa o un reembolso hecho fuera de la app alertan a finanzas |
+
+Cada evento corre en su propio savepoint. Si falla, suma un intento y se reintenta con espera creciente (1, 2, 4, 8 minutos… hasta 6 h). Al llegar a `WEBHOOK_MAX_ATTEMPTS` (8) pasa a `DEAD` y se alerta a finanzas (`payment.webhook_dead`). El error guardado es solo un código, nunca el mensaje.
+
+Además, cada autorización, captura, anulación o rechazo queda en `payment_transactions` (solo inserción; uno por tipo y cobro).
+
+### 14.3 Conciliación diaria (`app/payments/reconciliation.py`, trabajo `payments.reconcile`)
+
+La red de seguridad por si un webhook nunca llega. Corre una vez cada `RECONCILIATION_INTERVAL_HOURS` (24) sobre los cobros de las últimas `RECONCILIATION_WINDOW_HOURS` (48) y todos los que siguen abiertos:
+
+| Situación | Acción |
+|---|---|
+| Estado atrasado aquí (autorizado aquí, cobrado allá) | Se corrige por la vía normal (solo transiciones válidas) |
+| Cobro autorizado en Stripe cuyo id no quedó guardado (caída a mitad de la llamada) | Se reconoce por la metadata y se corrige |
+| Montos distintos | Alerta `AMOUNT_MISMATCH` |
+| Estado que no es seguro corregir (cobrado aquí, anulado allá) | Alerta `STATUS_MISMATCH` |
+| Cobro que existe solo en Stripe | Alerta `PROVIDER_ONLY` |
+| Cuenta de técnico sin sincronizar en 24 h | Se vuelve a consultar |
+
+Para Stripe, un cobro reembolsado o en disputa sigue "succeeded": eso se considera consistente y no genera alertas. Las alertas no se repiten para el mismo caso en 24 h. Cada corrida queda en `audit_logs` (`payment.reconciliation.run`) con sus conteos.
+
+### 14.4 Anulaciones pendientes (trabajo `payments.retry_voids`)
+
+Si Stripe no respondió al anular una reserva (Fase 3), el trabajo la reintenta hasta 8 veces.
+
+### 14.5 Configurar los webhooks en Stripe (modo prueba)
+
+1. En Stripe, en modo prueba: **Developers → Webhooks → Add endpoint**, con la URL `https://<tu-dominio>/api/v1/webhooks/stripe` y los eventos de la plataforma de la tabla 14.1. Copia su *Signing secret* a `STRIPE_WEBHOOK_SECRET`.
+2. Agrega otro endpoint marcando **"Listen to events on Connected accounts"**, con la URL `.../webhooks/stripe-connect` y los eventos de Connect. Su secreto va en `STRIPE_CONNECT_WEBHOOK_SECRET` y debe ser distinto.
+3. En desarrollo local, con Stripe CLI: `stripe listen --forward-to localhost:8000/api/v1/webhooks/stripe` (y `--forward-connect-to` para Connect); el CLI imprime el `whsec_` que va en `.env`.
+
+### 14.6 Pruebas
+
+`tests/test_payments_webhooks.py` (firmas reales calculadas como Stripe: válidas, falsas, sin firma, del otro endpoint, viejas y con cuerpo alterado; duplicados; tamaño; nada de datos personales guardados; cobro hecho fuera de la app; evento falso con firma válida que no cambia nada; 3D Secure completado por webhook; modo distinto; eventos diferidos; reintentos, espera y DEAD; cuentas, desautorización y depósitos; anulaciones pendientes; conciliación que corrige, alerta sin repetir, es consistente con reembolsos, corre una vez al día y sincroniza cuentas) y, en `tests/test_payments_provider.py`, la verificación de firmas del adaptador, los depósitos en la cuenta conectada y el listado de cobros.
+
+### 14.7 Limitaciones conocidas
+
+- **Reembolsos y disputas** (Fase 5): sus eventos se guardan y alertan, pero la lógica llega en la siguiente fase; después se pueden reprocesar los que quedaron con `DEFERRED_PHASE_5`.
+- Los eventos `PROCESSED`/`IGNORED` no se borran todavía; conviene una política de retención (p. ej. 90 días) junto con las demás de la Fase 5 del KYC.
+- El tope global contra inundación del endpoint de webhooks va en Nginx (por IP de Stripe), no por usuario.

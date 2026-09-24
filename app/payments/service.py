@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.core.actor import Actor
@@ -50,6 +51,8 @@ from app.models import (
     PaymentCustomer,
     PaymentKind,
     PaymentStatus,
+    PaymentTransaction,
+    PaymentTransactionType,
     ServiceOrder,
     User,
 )
@@ -112,6 +115,18 @@ def _technician_has_rfc(db: Session, technician_id: uuid.UUID | None) -> bool:
     if technician_id is None:
         return False
     return db.scalar(select(KycProfile.rfc_hash).where(KycProfile.technician_id == technician_id)) is not None
+
+
+def _record(db: Session, payment: Payment, type_: PaymentTransactionType, status: str, *,
+            amount_cents: int | None = None, failure_code: str | None = None) -> None:
+    """Historial de lo que pasó en el proveedor (solo inserción; un registro por tipo y objeto)."""
+    if not payment.provider_payment_id:
+        return
+    db.execute(insert(PaymentTransaction).values(
+        payment_id=payment.id, type=type_, provider_object_id=payment.provider_payment_id,
+        amount_cents=payment.amount_cents if amount_cents is None else amount_cents, status=status,
+        failure_code=failure_code, raw_status=payment.status.value)
+        .on_conflict_do_nothing(constraint="uq_payment_transactions_type_object"))
 
 
 def _breakdown(db: Session, payment: Payment) -> CommissionTransaction:
@@ -288,6 +303,7 @@ def _cancelled_by_provider(db: Session, payment: Payment, before: PaymentStatus)
     """La reserva se anuló fuera de nuestra app (p. ej. venció la autorización)."""
     move(payment, P.CANCELLED)
     payment.cancelled_at = _now()
+    _record(db, payment, PaymentTransactionType.CANCEL, "provider_canceled")
     order = db.get(ServiceOrder, payment.service_order_id)
     if order is not None and order.status == O.SCHEDULED:
         _replacement(db, payment)                   # el técnico volverá a autorizar al salir
@@ -326,6 +342,7 @@ def cancel_for_order(db: Session, order: ServiceOrder, provider: PaymentProvider
     payment.cancelled_at = _now()
     order.departed_at = None
     if pid:
+        _record(db, payment, PaymentTransactionType.CANCEL, "requested")
         try:
             _provider(provider).cancel_authorization(pid, payment.id)
         except ProviderError:
@@ -429,6 +446,7 @@ def mark_authorized(db: Session, payment: Payment, *, provider_payment_id: str,
         payment.provider_payment_id = provider_payment_id
         payment.payment_method_fingerprint = payment_method_fingerprint
         db.flush()
+        _record(db, payment, PaymentTransactionType.AUTHORIZATION, "succeeded")
 
 
 def mark_captured(db: Session, payment: Payment) -> None:
@@ -440,6 +458,7 @@ def mark_captured(db: Session, payment: Payment) -> None:
     payment.captured_cents = payment.amount_cents
     payment.captured_at = _now()
     db.flush()
+    _record(db, payment, PaymentTransactionType.CAPTURE, "succeeded", amount_cents=payment.captured_cents)
     ledger.post_capture(db, payment, _breakdown(db, payment))
     orders.on_payment_captured(db, payment.service_order_id)
 
@@ -451,10 +470,13 @@ def mark_failed(db: Session, payment: Payment, failure_code: str) -> None:
     """
     from app.orders import service as orders
 
+    before = payment.status
     if not move(payment, P.FAILED):
         return
     payment.failure_code = failure_code[:60]
     db.flush()
+    _record(db, payment, PaymentTransactionType.CAPTURE if before == P.AUTHORIZED
+            else PaymentTransactionType.AUTHORIZATION, "failed", failure_code=failure_code[:60])
     order = db.get(ServiceOrder, payment.service_order_id)
     if order is None or order.status != O.SCHEDULED:
         orders.on_payment_failed(db, payment.service_order_id, failure_code)

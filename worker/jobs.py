@@ -9,6 +9,8 @@ Trabajos periódicos del negocio (proceso aparte del worker de documentos, que n
 - Órdenes: aprobación automática a las 72 h (decisión D5); solicitudes sin técnico caducan.
 - Pagos: aprobación y captura 24 h antes de que venza la autorización; captura de las órdenes
   aprobadas (idempotente en el proveedor: capture:{pago}); limpieza de Idempotency-Keys vencidas.
+- Webhooks: procesa la bandeja de eventos del proveedor (re-consultando cada objeto), reintenta
+  anulaciones pendientes y concilia con el proveedor una vez al día.
 
 Cada trabajo corre en su propia transacción: si uno falla, los demás siguen. Un candado
 consultivo de PostgreSQL evita que dos réplicas ejecuten el mismo ciclo a la vez.
@@ -26,7 +28,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.kyc import decisions
 from app.orders import service as orders
-from app.payments import idempotency
+from app.payments import idempotency, reconciliation, webhooks
 from app.payments import service as payments
 from app.security import log_sanitizer
 
@@ -34,6 +36,7 @@ log = logging.getLogger("jobs")
 _LOCK_ID = 0x4D554C5449          # "MULTI": candado consultivo del programador de trabajos
 
 JOBS: dict[str, Callable[[Session], int]] = {
+    "payments.process_webhooks": webhooks.process_pending,
     "kyc.release_stale_claims": decisions.release_stale_claims,
     "kyc.expire_approvals": decisions.expire_approvals,
     "orders.auto_approve": orders.auto_approve,
@@ -41,6 +44,8 @@ JOBS: dict[str, Callable[[Session], int]] = {
     "payments.enforce_capture_deadline": payments.enforce_capture_deadline,
     "payments.capture_due": payments.capture_due,
     "payments.purge_idempotency_keys": idempotency.purge_expired,
+    "payments.retry_voids": webhooks.retry_voids,
+    "payments.reconcile": reconciliation.reconcile,
 }
 
 

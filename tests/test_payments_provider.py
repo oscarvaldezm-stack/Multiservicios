@@ -122,7 +122,10 @@ def stub(**results):
                                                  {"id": "seti_1", "client_secret": "seti_1_secret_abc"})),
         payment_intents=SimpleNamespace(create=res("pi.create", PI_AUTHORIZED), capture=res("pi.capture", PI_PAID),
                                         cancel=res("pi.cancel", {"id": "pi_1", "status": "canceled", "amount": 116000}),
-                                        retrieve=res("pi.retrieve", PI_AUTHORIZED)),
+                                        retrieve=res("pi.retrieve", PI_AUTHORIZED),
+                                        list=res("pi.list", {"data": [PI_AUTHORIZED | {"metadata": {"payment_id": "p1"}}]})),
+        payouts=SimpleNamespace(retrieve=res("po.retrieve", {"id": "po_1", "amount": 88100, "currency": "mxn",
+                                                              "status": "paid", "arrival_date": 1_800_000_000})),
     )
     return SimpleNamespace(v1=v1), calls
 
@@ -303,3 +306,58 @@ def test_error_de_red_al_capturar_es_reintentable():
     with pytest.raises(ProviderError) as err:
         StripePaymentProvider(settings(), client).capture("pi_1", uuid.UUID(int=9), 1)
     assert err.value.retryable
+
+
+# ------------------------------------------------------------------ webhooks y conciliación (Fase 4)
+def _signed(payload: bytes, secret: str, ts: int | None = None) -> str:
+    import hashlib
+    import hmac
+    import time
+    ts = ts or int(time.time())
+    return f"t={ts},v1=" + hmac.new(secret.encode(), f"{ts}.".encode() + payload, hashlib.sha256).hexdigest()
+
+
+def test_webhook_verificado_se_reduce_a_lo_minimo():
+    import json
+    body = json.dumps({"id": "evt_1", "object": "event", "type": "payout.paid", "livemode": False, "created": 5,
+                       "account": "acct_9", "data": {"object": {"id": "po_1", "object": "payout",
+                                                                "destination": "ba_123"}}}).encode()
+    client, _ = stub()
+    p = StripePaymentProvider(settings(STRIPE_CONNECT_WEBHOOK_SECRET=WH2), client)
+    ev = p.verify_webhook(body, _signed(body, WH2), "connect")
+    assert (ev.provider_event_id, ev.type, ev.object_id, ev.object_type, ev.account_id, ev.livemode) == \
+        ("evt_1", "payout.paid", "po_1", "payout", "acct_9", False)
+
+
+@pytest.mark.parametrize("secret,endpoint,age", [(WH1, "connect", 0), (WH2, "connect", 400), ("whsec_x", "connect", 0)])
+def test_webhook_con_firma_incorrecta_o_vieja(secret, endpoint, age):
+    import time
+    body = b'{"id": "evt_1", "object": "event", "type": "x", "data": {"object": {}}}'
+    client, _ = stub()
+    p = StripePaymentProvider(settings(STRIPE_WEBHOOK_SECRET=WH1, STRIPE_CONNECT_WEBHOOK_SECRET=WH2), client)
+    with pytest.raises(ProviderError) as err:
+        p.verify_webhook(body, _signed(body, secret, int(time.time()) - age), endpoint)
+    assert err.value.code == "WEBHOOK_SIGNATURE_INVALID" and err.value.http_status == 400
+
+
+def test_webhook_sin_secreto_configurado():
+    client, _ = stub()
+    with pytest.raises(ProviderError) as err:
+        StripePaymentProvider(settings(STRIPE_WEBHOOK_SECRET=None), client).verify_webhook(b"{}", "t=1,v1=x",
+                                                                                           "platform")
+    assert err.value.code == "PAYMENT_PROVIDER_MISCONFIGURED"
+
+
+def test_deposito_se_consulta_en_la_cuenta_conectada():
+    client, calls = stub()
+    po = StripePaymentProvider(settings(), client).get_payout("acct_9", "po_1")
+    assert calls[0][2]["options"] == {"stripe_account": "acct_9"}
+    assert (po.amount_cents, po.currency, po.status) == (88_100, "MXN", "paid") and po.arrival_date is not None
+
+
+def test_listado_de_cobros_para_conciliar():
+    client, calls = stub()
+    frm, to = datetime(2026, 9, 1, tzinfo=timezone.utc), datetime(2026, 9, 3, tzinfo=timezone.utc)
+    items = StripePaymentProvider(settings(), client).list_payments(frm, to)
+    assert calls[0][2]["params"]["created"] == {"gte": int(frm.timestamp()), "lt": int(to.timestamp())}
+    assert items[0].metadata_payment_id == "p1" and items[0].status.value == "AUTHORIZED"

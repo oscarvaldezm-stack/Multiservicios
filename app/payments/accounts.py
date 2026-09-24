@@ -51,6 +51,7 @@ ALLOWED_ACCOUNT_TRANSITIONS: frozenset[tuple[PaymentAccountStatus, PaymentAccoun
 
 KYC_BLOCKS = frozenset({"KYC_SUSPENDED", "KYC_EXPIRED"})
 NAME_MISMATCH = "NAME_MISMATCH"
+PROVIDER_DEAUTHORIZED = "PROVIDER_DEAUTHORIZED"     # el técnico desconectó la plataforma de su cuenta
 SYNC_MIN_INTERVAL = timedelta(seconds=15)       # la consulta del técnico no martillea al proveedor
 
 
@@ -254,6 +255,17 @@ def block_for_kyc(db: Session, technician_id: uuid.UUID, reason: str) -> None:
             account.blocked_reason = reason
             account.version += 1
     db.flush()
+
+
+def block(db: Session, account: TechnicianPaymentAccount, reason: str) -> None:
+    """Bloqueo de la plataforma sobre una cuenta YA bloqueada en la sesión; suelta sus órdenes si podía cobrar."""
+    was_eligible = account.can_receive_payments
+    if account.blocked_reason in (None, *KYC_BLOCKS, NAME_MISMATCH):
+        account.blocked_reason = reason
+        account.version += 1
+    db.flush()
+    if was_eligible:
+        _release_orders(db, account.technician_id)
 
 
 def unblock_for_kyc(db: Session, technician_id: uuid.UUID) -> None:

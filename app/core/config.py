@@ -128,6 +128,11 @@ class Settings(BaseSettings):
     # Versión de la API fijada: un cambio de Stripe no altera el comportamiento sin un despliegue revisado.
     STRIPE_API_VERSION: str = Field(default="2026-08-26.dahlia", min_length=10, max_length=40)
     STRIPE_MAX_NETWORK_RETRIES: int = Field(default=2, ge=0, le=5)
+    # --- Pagos (Fase 4: webhooks y conciliación) --------------------------------------------
+    WEBHOOK_MAX_BODY_BYTES: int = Field(default=512 * 1024, ge=1024)   # un evento de Stripe pesa unos KB
+    WEBHOOK_MAX_ATTEMPTS: int = Field(default=8, ge=1, le=20)           # después: DEAD y alerta a finanzas
+    RECONCILIATION_WINDOW_HOURS: int = Field(default=48, ge=24, le=24 * 14)
+    RECONCILIATION_INTERVAL_HOURS: int = Field(default=24, ge=1, le=24 * 7)
     # Adónde vuelve el técnico al terminar (o al vencer) el formulario de Stripe. HTTPS en producción.
     STRIPE_CONNECT_RETURN_URL: str = "http://localhost:3000/pagos/cuenta/listo"
     STRIPE_CONNECT_REFRESH_URL: str = "http://localhost:3000/pagos/cuenta/reintentar"

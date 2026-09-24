@@ -25,6 +25,9 @@ import tempfile as _tempfile  # noqa: E402
 os.environ["STORAGE_BACKEND"] = "local"
 os.environ["STORAGE_LOCAL_ROOT"] = _tempfile.mkdtemp(prefix="kyc-storage-test-")
 os.environ["KYC_SCANNER"] = "dev_eicar"
+# Secretos de firma de webhooks SOLO de prueba (el proveedor falso verifica igual que Stripe).
+os.environ["STRIPE_WEBHOOK_SECRET"] = "whsec_" + "p" * 32
+os.environ["STRIPE_CONNECT_WEBHOOK_SECRET"] = "whsec_" + "c" * 32
 
 from datetime import date  # noqa: E402
 from pathlib import Path  # noqa: E402

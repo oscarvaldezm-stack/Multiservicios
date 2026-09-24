@@ -7,7 +7,8 @@ de este módulo. Agregar Mercado Pago = un adaptador nuevo, sin tocar tablas ni 
 
 Fase 2: cuentas conectadas del técnico, cliente del proveedor y guardado de tarjeta.
 Fase 3: autorizar (captura manual con cargo de destino), capturar, anular y consultar un cobro.
-Las fases 4 y 5 agregan verify_webhook / refund / payouts / disputes a este mismo contrato.
+Fase 4: verificar webhooks, consultar depósitos al técnico y listar cobros para la conciliación.
+La Fase 5 agrega refund / disputes a este mismo contrato.
 """
 from __future__ import annotations
 
@@ -121,6 +122,33 @@ class ProviderPayment:
     failure_code: str | None = None
     payment_method_fingerprint: str | None = None
     client_secret: str | None = field(default=None, repr=False)   # solo para que el dueño complete 3D Secure
+    metadata_payment_id: str | None = None      # nuestro id de pago, guardado en el cobro al autorizar
+
+
+@dataclass(frozen=True)
+class WebhookEvent:
+    """
+    Evento ya verificado y reducido a lo mínimo. No se guarda el objeto completo (puede traer
+    correos, nombres o datos de facturación): el worker vuelve a consultar el objeto al proveedor.
+    """
+
+    provider_event_id: str
+    type: str
+    object_id: str | None
+    object_type: str | None
+    account_id: str | None          # cuenta conectada (eventos de Connect)
+    livemode: bool
+    created: int
+
+
+@dataclass(frozen=True)
+class PayoutInfo:
+    provider_payout_id: str
+    amount_cents: int
+    currency: str
+    status: str                     # pending, in_transit, paid, failed, canceled
+    arrival_date: date | None = None
+    failure_code: str | None = None
 
 
 class PaymentProvider(abc.ABC):
@@ -173,3 +201,19 @@ class PaymentProvider(abc.ABC):
     @abc.abstractmethod
     def get_payment(self, provider_payment_id: str) -> ProviderPayment:
         """Estado real del cobro en el proveedor (fuente de verdad)."""
+
+    # ---------------------------------------------------------------- webhooks y conciliación (Fase 4)
+    @abc.abstractmethod
+    def verify_webhook(self, payload: bytes, signature: str | None, endpoint: str) -> WebhookEvent:
+        """
+        Verifica la firma sobre el cuerpo CRUDO con el secreto de ese endpoint ("platform" o "connect")
+        y una tolerancia de 5 minutos (bloquea replays). Firma inválida → ProviderError WEBHOOK_SIGNATURE_INVALID.
+        """
+
+    @abc.abstractmethod
+    def get_payout(self, provider_account_id: str, provider_payout_id: str) -> PayoutInfo:
+        """Depósito de una cuenta conectada al banco del técnico."""
+
+    @abc.abstractmethod
+    def list_payments(self, created_from: datetime, created_to: datetime) -> list[ProviderPayment]:
+        """Cobros creados en el periodo (para detectar los que existen solo en el proveedor)."""

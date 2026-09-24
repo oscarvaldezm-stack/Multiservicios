@@ -21,9 +21,11 @@ from app.payments.providers.base import (
     OnboardingLink,
     PaymentProvider,
     ProviderError,
+    PayoutInfo,
     ProviderPayment,
     SavedCard,
     SetupIntentInfo,
+    WebhookEvent,
 )
 
 
@@ -50,6 +52,7 @@ class FakePaymentProvider(PaymentProvider):
         self._card_owner: dict[str, str] = {}
         self._fingerprints: dict[str, str] = {}
         self.decline_next: str | None = None        # "card_declined", "insufficient_funds", "authentication_required"
+        self.payouts: dict[tuple[str, str], PayoutInfo] = {}
 
     def _enter(self, op: str) -> None:
         self.calls.append(op)
@@ -131,7 +134,8 @@ class FakePaymentProvider(PaymentProvider):
         return ProviderPayment(provider_payment_id=pid, status=i["status"], amount_cents=i["amount"],
                                amount_capturable_cents=i["amount"] if i["status"] == PaymentStatus.AUTHORIZED else 0,
                                amount_received_cents=i["received"], failure_code=i["failure_code"],
-                               payment_method_fingerprint=i["fingerprint"], client_secret=i["client_secret"])
+                               payment_method_fingerprint=i["fingerprint"], client_secret=i["client_secret"],
+                               metadata_payment_id=str(i["request"].payment_id) if i.get("request") else None)
 
     def authorize(self, req: AuthorizationRequest) -> ProviderPayment:
         self._enter("payment_intents.create")
@@ -153,7 +157,8 @@ class FakePaymentProvider(PaymentProvider):
             status = PaymentStatus.FAILED
         self.intents[pid] = {"status": status, "amount": req.amount_cents, "received": 0, "request": req,
                              "failure_code": decline, "fingerprint": self._fingerprints[req.payment_method_id],
-                             "client_secret": f"{pid}_secret_{secrets.token_hex(8)}", "captures": 0}
+                             "client_secret": f"{pid}_secret_{secrets.token_hex(8)}", "captures": 0,
+                             "created": datetime.now(timezone.utc)}
         self._intent_by_payment[req.payment_id] = pid
         return self._view(pid)
 
@@ -186,3 +191,39 @@ class FakePaymentProvider(PaymentProvider):
     def set_intent(self, provider_payment_id: str, **changes) -> None:
         """Simula cambios en el proveedor que la app no provocó (p. ej. la autorización venció)."""
         self.intents[provider_payment_id].update(changes)
+
+    # ------------------------------------------------------------------ webhooks y conciliación (Fase 4)
+    def verify_webhook(self, payload: bytes, signature: str | None, endpoint: str) -> WebhookEvent:
+        # Misma verificación que Stripe (local, sin red) con los secretos configurados.
+        from app.core.config import get_settings
+        from app.payments.providers.stripe_provider import verify_stripe_signature, webhook_secret
+
+        self._enter("webhooks.verify")
+        return verify_stripe_signature(payload, signature, webhook_secret(get_settings(), endpoint))
+
+    def add_payout(self, provider_account_id: str, amount_cents: int = 88_100, status: str = "paid",
+                   failure_code: str | None = None) -> str:
+        po = f"po_fake{secrets.token_hex(6)}"
+        self.payouts[(provider_account_id, po)] = PayoutInfo(
+            provider_payout_id=po, amount_cents=amount_cents, currency="MXN", status=status,
+            arrival_date=datetime.now(timezone.utc).date(), failure_code=failure_code)
+        return po
+
+    def get_payout(self, provider_account_id: str, provider_payout_id: str) -> PayoutInfo:
+        self._enter("payouts.retrieve")
+        try:
+            return self.payouts[(provider_account_id, provider_payout_id)]
+        except KeyError:
+            raise ProviderError("Depósito inexistente", code="PAYMENT_PROVIDER_REJECTED") from None
+
+    def list_payments(self, created_from: datetime, created_to: datetime) -> list[ProviderPayment]:
+        self._enter("payment_intents.list")
+        return [self._view(pid) for pid, i in self.intents.items() if created_from <= i["created"] < created_to]
+
+    def add_foreign_intent(self, amount_cents: int = 50_000, status: PaymentStatus = PaymentStatus.PAID) -> str:
+        """Cobro creado fuera de nuestra app (p. ej. desde el panel de Stripe): la conciliación debe detectarlo."""
+        pid = f"pi_fake{secrets.token_hex(8)}"
+        self.intents[pid] = {"status": status, "amount": amount_cents, "received": amount_cents, "request": None,
+                             "failure_code": None, "fingerprint": None, "client_secret": f"{pid}_secret_x",
+                             "captures": 1, "created": datetime.now(timezone.utc)}
+        return pid

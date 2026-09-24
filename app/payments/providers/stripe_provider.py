@@ -32,12 +32,39 @@ from app.payments.providers.base import (
     OnboardingLink,
     PaymentProvider,
     ProviderError,
+    PayoutInfo,
     ProviderPayment,
     SavedCard,
     SetupIntentInfo,
+    WebhookEvent,
 )
 
+WEBHOOK_TOLERANCE_SECONDS = 300          # firma con más de 5 minutos: se rechaza (evita replays)
+
 log = logging.getLogger("payments")
+
+
+def verify_stripe_signature(payload: bytes, signature: str | None, secret: str | None) -> WebhookEvent:
+    """Verificación local (sin red) del encabezado Stripe-Signature sobre el cuerpo crudo."""
+    if not secret:
+        raise ProviderError("Webhook no configurado", code="PAYMENT_PROVIDER_MISCONFIGURED", http_status=503)
+    if not signature:
+        raise ProviderError("Falta la firma", code="WEBHOOK_SIGNATURE_INVALID", http_status=400)
+    try:
+        event = stripe.Webhook.construct_event(payload, signature, secret, tolerance=WEBHOOK_TOLERANCE_SECONDS)
+    except (stripe.SignatureVerificationError, ValueError):
+        raise ProviderError("Firma inválida", code="WEBHOOK_SIGNATURE_INVALID", http_status=400) from None
+    obj = _get(event, "data", "object")
+    return WebhookEvent(provider_event_id=str(event["id"]), type=str(_get(event, "type")),
+                        object_id=_get(obj, "id"), object_type=_get(obj, "object"),
+                        account_id=_get(event, "account"), livemode=bool(_get(event, "livemode")),
+                        created=int(_get(event, "created") or 0))
+
+
+def webhook_secret(settings: Settings, endpoint: str) -> str | None:
+    """Un secreto distinto por endpoint: el de la plataforma no valida eventos de Connect ni al revés."""
+    secret = {"platform": settings.STRIPE_WEBHOOK_SECRET, "connect": settings.STRIPE_CONNECT_WEBHOOK_SECRET}[endpoint]
+    return secret.get_secret_value() if secret else None
 
 
 def _get(obj: Any, *path: str) -> Any:
@@ -202,7 +229,8 @@ class StripePaymentProvider(PaymentProvider):
             amount_capturable_cents=int(_get(pi, "amount_capturable") or 0),
             amount_received_cents=int(_get(pi, "amount_received") or 0),
             failure_code=(_get(error, "decline_code") or _get(error, "code")) if error is not None else None,
-            payment_method_fingerprint=fingerprint, client_secret=_get(pi, "client_secret"))
+            payment_method_fingerprint=fingerprint, client_secret=_get(pi, "client_secret"),
+            metadata_payment_id=_get(pi, "metadata", "payment_id"))
 
     def authorize(self, req: AuthorizationRequest) -> ProviderPayment:
         params = {
@@ -251,3 +279,22 @@ class StripePaymentProvider(PaymentProvider):
         pi = self._call("payment_intents.retrieve", self._c.v1.payment_intents.retrieve, provider_payment_id,
                         params={"expand": ["latest_charge"]})
         return self._to_payment(pi)
+
+    # ------------------------------------------------------------------ webhooks y conciliación (Fase 4)
+    def verify_webhook(self, payload: bytes, signature: str | None, endpoint: str) -> WebhookEvent:
+        return verify_stripe_signature(payload, signature, webhook_secret(self._s, endpoint))
+
+    def get_payout(self, provider_account_id: str, provider_payout_id: str) -> PayoutInfo:
+        po = self._call("payouts.retrieve", self._c.v1.payouts.retrieve, provider_payout_id,
+                        options={"stripe_account": provider_account_id})
+        arrival = _get(po, "arrival_date")
+        return PayoutInfo(provider_payout_id=po["id"], amount_cents=int(_get(po, "amount") or 0),
+                          currency=str(_get(po, "currency") or "mxn").upper(), status=str(_get(po, "status")),
+                          arrival_date=datetime.fromtimestamp(arrival, timezone.utc).date() if arrival else None,
+                          failure_code=_get(po, "failure_code"))
+
+    def list_payments(self, created_from: datetime, created_to: datetime) -> list[ProviderPayment]:
+        page = self._call("payment_intents.list", self._c.v1.payment_intents.list, params={
+            "created": {"gte": int(created_from.timestamp()), "lt": int(created_to.timestamp())}, "limit": 100})
+        items = page.auto_paging_iter() if hasattr(page, "auto_paging_iter") else (_get(page, "data") or [])
+        return [self._to_payment(pi) for pi in items]
