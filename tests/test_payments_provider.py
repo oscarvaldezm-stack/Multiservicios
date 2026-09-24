@@ -105,6 +105,12 @@ PI_AUTHORIZED = {"id": "pi_1", "status": "requires_capture", "amount": 116000, "
 PI_PAID = {"id": "pi_1", "status": "succeeded", "amount": 116000, "amount_received": 116000, "latest_charge": "ch_1"}
 
 
+REFUND = {"id": "re_1", "payment_intent": "pi_1", "amount": 34800, "status": "succeeded",
+          "transfer_reversal": "trr_9", "metadata": {"refund_id": "r1"}}
+DISPUTE = {"id": "dp_1", "payment_intent": "pi_1", "amount": 116000, "reason": "fraudulent",
+           "status": "needs_response", "evidence_details": {"due_by": 1_800_000_000}}
+
+
 def stub(**results):
     calls: list = []
 
@@ -126,6 +132,13 @@ def stub(**results):
                                         list=res("pi.list", {"data": [PI_AUTHORIZED | {"metadata": {"payment_id": "p1"}}]})),
         payouts=SimpleNamespace(retrieve=res("po.retrieve", {"id": "po_1", "amount": 88100, "currency": "mxn",
                                                               "status": "paid", "arrival_date": 1_800_000_000})),
+        refunds=SimpleNamespace(create=res("re.create", REFUND), retrieve=res("re.retrieve", REFUND)),
+        disputes=SimpleNamespace(retrieve=res("dp.retrieve", DISPUTE),
+                                 update=res("dp.update", DISPUTE | {"status": "under_review"})),
+        transfers=SimpleNamespace(reversals=SimpleNamespace(create=res("trr.create", {"id": "trr_1"}))),
+        balance=SimpleNamespace(retrieve=res("bal.retrieve", {
+            "available": [{"amount": 12345, "currency": "mxn"}, {"amount": 99, "currency": "usd"}],
+            "pending": [{"amount": 500, "currency": "mxn"}]})),
     )
     return SimpleNamespace(v1=v1), calls
 
@@ -361,3 +374,42 @@ def test_listado_de_cobros_para_conciliar():
     items = StripePaymentProvider(settings(), client).list_payments(frm, to)
     assert calls[0][2]["params"]["created"] == {"gte": int(frm.timestamp()), "lt": int(to.timestamp())}
     assert items[0].metadata_payment_id == "p1" and items[0].status.value == "AUTHORIZED"
+
+
+# ------------------------------------------------------------------ Fase 5
+def test_reembolso_con_politica_y_llave():
+    from app.payments.providers.base import RefundRequest
+    client, calls = stub()
+    rid = uuid.UUID(int=11)
+    info = StripePaymentProvider(settings(), client).refund(RefundRequest(
+        refund_id=rid, provider_payment_id="pi_1", amount_cents=34_800, reverse_transfer=True,
+        refund_application_fee=True))
+    p = calls[0][2]["params"]
+    assert (p["payment_intent"], p["amount"], p["reverse_transfer"], p["refund_application_fee"], p["reason"]) == \
+        ("pi_1", 34_800, True, True, "requested_by_customer")
+    assert calls[0][2]["options"] == {"idempotency_key": f"refund:{rid}"}
+    assert (info.status, info.transfer_reversed, info.metadata_refund_id) == ("succeeded", True, "r1")
+
+
+def test_captura_parcial_manda_la_comision_recalculada():
+    client, calls = stub()
+    StripePaymentProvider(settings(), client).capture("pi_1", uuid.UUID(int=9), 34_800, application_fee_cents=13_590)
+    assert calls[0][2]["params"]["amount_to_capture"] == 34_800
+    assert calls[0][2]["params"]["application_fee_amount"] == 13_590
+
+
+def test_disputa_evidencia_reversion_y_saldo():
+    client, calls = stub(**{"pi.retrieve": {"id": "pi_1", "status": "succeeded", "amount": 1,
+                                            "latest_charge": {"id": "ch_1", "transfer": "tr_7"}}})
+    p = StripePaymentProvider(settings(), client)
+    d = p.get_dispute("dp_1")
+    assert (d.provider_payment_id, d.amount_cents, d.status) == ("pi_1", 116_000, "needs_response")
+    assert d.evidence_due_by is not None
+    assert p.submit_dispute_evidence("dp_1", {"uncategorized_text": "x"}).status == "under_review"
+    assert calls[-1][2]["params"] == {"evidence": {"uncategorized_text": "x"}, "submit": True}
+    assert p.reverse_transfer("pi_1", 88_100, "dispute-reversal:d1") == "trr_1"
+    assert calls[-1][1] == ("tr_7",) and calls[-1][2]["params"] == {"amount": 88_100}
+    assert calls[-1][2]["options"] == {"idempotency_key": "dispute-reversal:d1"}
+    bal = p.get_balance("acct_9")
+    assert (bal.available_cents, bal.pending_cents) == (12_345, 500)
+    assert calls[-1][2]["options"] == {"stripe_account": "acct_9"}

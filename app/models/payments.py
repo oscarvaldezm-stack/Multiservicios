@@ -156,7 +156,10 @@ class Payment(TimestampMixin, Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
 
     order: Mapped["ServiceOrder"] = relationship(back_populates="payments")  # noqa: F821
-    breakdown: Mapped["CommissionTransaction | None"] = relationship(back_populates="payment", uselist=False)
+    # Desglose de la cotización (el que se autorizó). Si hubo captura parcial existe además uno CAPTURE.
+    breakdown: Mapped["CommissionTransaction | None"] = relationship(
+        primaryjoin="and_(Payment.id == CommissionTransaction.payment_id, CommissionTransaction.stage == 'QUOTE')",
+        viewonly=True, uselist=False)
 
 
 class PaymentTransaction(Base):
@@ -224,6 +227,8 @@ class CommissionTransaction(Base):
     """
     Desglose congelado de un pago, con copia de la regla y de las tasas aplicadas.
     Invariante (CHECK): técnico + comisión + IVA de la comisión + retenciones = bruto − descuento.
+    Etapas: QUOTE (lo que se autorizó; cuadra con payments.amount_cents) y, si se cobró menos
+    (cargo por visita, servicio parcial), CAPTURE (recalculado sobre lo capturado).
     """
 
     __tablename__ = "commission_transactions"
@@ -237,12 +242,15 @@ class CommissionTransaction(Base):
         CheckConstraint(
             "technician_cents + commission_cents + commission_tax_cents + withholding_isr_cents "
             "+ withholding_iva_cents = gross_cents - discount_cents", name="split_adds_up"),
+        CheckConstraint("stage IN ('QUOTE', 'CAPTURE')", name="stage_valid"),
+        UniqueConstraint("payment_id", "stage", name="uq_commission_transactions_payment_stage"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     payment_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("payments.id", ondelete="RESTRICT"), nullable=False, unique=True
+        Uuid, ForeignKey("payments.id", ondelete="RESTRICT"), nullable=False
     )
+    stage: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("'QUOTE'"))
     rule_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("commission_rules.id", ondelete="RESTRICT"))
     # Copia de la regla (LEGACY = pago anterior al motor de comisiones).
     rule_scope: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -268,8 +276,6 @@ class CommissionTransaction(Base):
     withholding_iva_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     technician_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    payment: Mapped[Payment] = relationship(back_populates="breakdown")
 
     @property
     def application_fee_cents(self) -> int:
@@ -309,6 +315,12 @@ class PaymentRefund(TimestampMixin, Base):
         # Stripe solo devuelve la comisión si también se revierte la transferencia.
         CheckConstraint("NOT refund_application_fee OR reverse_transfer", name="fee_refund_needs_reversal"),
         CheckConstraint("approved_by IS NULL OR approved_by <> requested_by", name="four_eyes"),
+        CheckConstraint("vat_returned_cents >= 0 AND withholding_returned_cents >= 0 AND platform_absorbed_cents >= 0",
+                        name="allocation_non_negative"),
+        CheckConstraint("request_source IN ('CLIENT', 'FINANCE', 'DISPUTE', 'OUTSIDE_APP')", name="source_valid"),
+        # Una sola solicitud abierta por pago (evita dobles reembolsos por clics o carreras).
+        Index("uq_payment_refunds_open", "payment_id", unique=True,
+              postgresql_where=text("status IN ('REQUESTED', 'APPROVED', 'PENDING')")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -320,14 +332,22 @@ class PaymentRefund(TimestampMixin, Base):
     reason_code: Mapped[str] = mapped_column(String(40), nullable=False)
     reverse_transfer: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     refund_application_fee: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # Quién absorbe el reembolso (se calcula al confirmarse; suma = amount_cents).
     technician_recovered_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     commission_returned_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    vat_returned_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    withholding_returned_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    platform_absorbed_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    request_source: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'FINANCE'"))
+    note: Mapped[str | None] = mapped_column(String(500))
     status: Mapped[RefundStatus] = mapped_column(
         pg_enum(RefundStatus, "refund_status"), nullable=False, server_default=RefundStatus.REQUESTED.value
     )
     failure_code: Mapped[str | None] = mapped_column(String(60))
     requested_by: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id", ondelete="RESTRICT"))
     approved_by: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id", ondelete="RESTRICT"))
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    succeeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PaymentDispute(TimestampMixin, Base):
@@ -350,6 +370,8 @@ class PaymentDispute(TimestampMixin, Base):
     evidence_due_by: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB)   # referencias a archivos privados
     transfer_reversal_id: Mapped[str | None] = mapped_column(String(120))
+    technician_recovered_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    evidence_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

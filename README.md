@@ -1,6 +1,6 @@
 # Multiservicios API: Backend
 
-Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa; Fase 4: webhooks, worker y conciliación).
+Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa; Fase 4: webhooks, worker y conciliación; Fase 5: reembolsos, cancelaciones, contracargos y estado de cuenta del técnico).
 
 FastAPI · SQLAlchemy 2.0 · PostgreSQL · OAuth2 Password Flow + JWT · Passlib/bcrypt
 
@@ -45,6 +45,10 @@ app/
 │   ├── idempotency.py   # Encabezado Idempotency-Key de los POST de pagos
 │   ├── webhooks.py      # Bandeja de webhooks y su worker (re-consulta al proveedor, reintentos)
 │   ├── reconciliation.py # Conciliación diaria con el proveedor
+│   ├── refunds.py       # Reembolsos: motivos → quién absorbe, doble firma (D8), asientos
+│   ├── cancellations.py # Políticas de cancelación: cargo tardío y cargo por visita
+│   ├── disputes.py      # Contracargos: evidencia y reversión al técnico solo si se pierde (D9)
+│   ├── statements.py    # Ganancias, depósitos y saldo del técnico
 │   └── providers/       # Contrato PaymentProvider, adaptador de Stripe y proveedor falso
 ├── reviews/             # Calificaciones: servicio, antifraude, reputación, firma de integridad, filtros de texto
 ├── audit/writer.py      # Auditoría con cadena de hashes y verify_chain()
@@ -62,9 +66,10 @@ app/
 │       ├── orders.py          # /orders, /clients/me/orders, /technicians/me/jobs-feed, /admin/orders
 │       ├── reviews.py         # /reviews, /technicians/{id}/reviews, /admin/reviews
 │       ├── payments.py        # /technicians/me/payment-account, /clients/me/payment-methods
-│       └── webhooks.py        # /webhooks/stripe y /webhooks/stripe-connect (firma, sin JWT)
+│       ├── webhooks.py        # /webhooks/stripe y /webhooks/stripe-connect (firma, sin JWT)
+│       └── finance.py         # Reembolsos, contracargos, políticas de cancelación, estado de cuenta
 └── main.py              # App, CORS, TrustedHost, headers de seguridad
-migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico, 0008 autorización y regla crítica ampliada
+migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico, 0008 autorización y regla crítica ampliada, 0009 reembolsos, captura parcial y contracargos
 scripts/
 ├── init_db.py           # Solo desarrollo: aplica migraciones y carga categorías
 ├── create_admin.py      # Único camino para crear administradores
@@ -73,7 +78,7 @@ scripts/
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
 worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas, captura de pagos, webhooks, conciliación
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
-tests/                   # 635 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+tests/                   # 663 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
@@ -947,6 +952,92 @@ Si Stripe no respondió al anular una reserva (Fase 3), el trabajo la reintenta 
 
 ### 14.7 Limitaciones conocidas
 
-- **Reembolsos y disputas** (Fase 5): sus eventos se guardan y alertan, pero la lógica llega en la siguiente fase; después se pueden reprocesar los que quedaron con `DEFERRED_PHASE_5`.
+- **Reembolsos y disputas:** hechos en la Fase 5 (sección 15). Los eventos que quedaron con `DEFERRED_PHASE_5` se pueden reprocesar cambiando su estado a `PENDING`.
 - Los eventos `PROCESSED`/`IGNORED` no se borran todavía; conviene una política de retención (p. ej. 90 días) junto con las demás de la Fase 5 del KYC.
 - El tope global contra inundación del endpoint de webhooks va en Nginx (por IP de Stripe), no por usuario.
+
+---
+
+## 15. Pagos, Fase 5: reembolsos, cancelaciones, contracargos y estado de cuenta del técnico
+
+Decisiones aplicadas (recomendaciones del doc de pagos): **D4** con un reclamo abierto se captura 24 h antes de que venza la autorización y se resuelve después con reembolso; **D8** doble aprobación arriba de **$2,000 MXN** (`REFUND_DOUBLE_APPROVAL_CENTS`); **D9** al técnico se le descuenta un contracargo **solo si se pierde**.
+
+### 15.1 Reembolsos (`app/payments/refunds.py`)
+
+Quién absorbe lo decide el **motivo** (catálogo en código, revisado), con los dos parámetros de Stripe:
+
+| Motivo | reverse_transfer | refund_application_fee | ¿Lo pide el cliente? | Quién absorbe |
+|---|---|---|---|---|
+| `SERVICE_NOT_PROVIDED`, `SERVICE_DEFICIENT` | Sí | Sí | Sí | Cada quien su parte |
+| `PRICE_ADJUSTMENT` | Sí | Sí | No | Cada quien su parte |
+| `DUPLICATE_CHARGE` | No | No | Sí | Plataforma |
+| `PLATFORM_ERROR`, `COURTESY` | No | No | No | Plataforma |
+| `OUTSIDE_APP` (hecho en el panel de Stripe) | No | No | — | Plataforma (y alerta) |
+
+El reparto es proporcional a lo cobrado (con captura parcial, a lo capturado), con redondeo hacia abajo en cada parte y el remanente para la plataforma. Ejemplo con cobro de $1,160 y reembolso de $348 por `SERVICE_DEFICIENT`: técnico $264.30, comisión $45.00, IVA $7.20, retenciones $31.50, plataforma $0. En el libro: `CUSTOMER` +, `TECHNICIAN_PAYABLE`, `PLATFORM_REVENUE`, `VAT_PAYABLE` y `TAX_WITHHELD` −, y `REFUNDS` − lo que absorbe la plataforma. **El ajuste fiscal de las retenciones de un pago reembolsado lo define tu contador.**
+
+| Método y ruta | Quién | Notas |
+|---|---|---|
+| `POST /api/v1/orders/{id}/refund-requests` | Cliente dueño | `Idempotency-Key`; motivo del cliente; monto opcional (sin monto = lo que queda); solo órdenes pagadas y dentro de `ORDER_DISPUTE_WINDOW_DAYS`; una solicitud abierta por pago |
+| `GET /api/v1/refunds/{id}` | Cliente dueño | Sin el reparto interno |
+| `GET /api/v1/admin/refunds?status=` | `FINANCE_READ` | Con el reparto y si espera segunda firma |
+| `POST /api/v1/admin/payments/{id}/refunds` | `REFUNDS_EXECUTE` (operador, admin) | `Idempotency-Key`; hasta el umbral se ejecuta con una firma; arriba queda `REQUESTED` |
+| `POST /api/v1/admin/refunds/{id}/approve` | `REFUNDS_EXECUTE`; arriba del umbral `REFUNDS_APPROVE_HIGH` (FINANCE_ADMIN) | Nunca quien lo pidió (403 `REFUND_FOUR_EYES`; la base lo repite con el CHECK `four_eyes`) |
+| `POST /api/v1/admin/refunds/{id}/reject` | `REFUNDS_EXECUTE` | Avisa al cliente |
+
+Estados `REQUESTED → APPROVED → PENDING → SUCCEEDED / FAILED` (o `REJECTED`), repetidos en un trigger que además impide cambiar monto, motivo, política o solicitante y borrar filas. Se ejecuta en Stripe con `Idempotency-Key refund:{id}`; el estado final lo confirma Stripe (respuesta o webhook `refund.*`). Si Stripe no responde, queda `APPROVED` y el trabajo `payments.retry_refunds` lo reenvía. **Si el técnico ya retiró su saldo**, Stripe rechaza la reversión: queda `FAILED` (`balance_insufficient`) con alerta a finanzas, que puede cubrirlo con un reembolso de plataforma. Un reembolso total pasa la orden a `REFUNDED` y oculta su reseña.
+
+### 15.2 Disputas de la orden (resolución de finanzas)
+
+| Resultado | Pago ya cobrado | Pago solo autorizado |
+|---|---|---|
+| `RELEASE` | La orden queda calificable | Se aprueba y el worker captura |
+| `PARTIAL_REFUND` | Reembolso `SERVICE_DEFICIENT` por el monto | **Captura parcial** de lo que sí corresponde (total − reembolso), con la comisión recalculada; el resto se libera |
+| `FULL_REFUND` | Reembolso `SERVICE_NOT_PROVIDED` de todo lo que queda; al confirmarse, `REFUNDED` | Se anula la reserva y la orden se cancela |
+
+Los reembolsos de una disputa siguen la misma regla de doble firma.
+
+### 15.3 Captura parcial
+
+`payments.capture_partial` cobra solo una parte de lo autorizado: recalcula el desglose sobre el precio cobrado con la regla y las tasas de la cotización (o con el reparto de una política de cancelación), lo guarda como etapa `CAPTURE` de `commission_transactions` y manda a Stripe `amount_to_capture` y la `application_fee_amount` recalculada. El resto de la reserva se libera solo. El libro y los reembolsos usan ese desglose.
+
+### 15.4 Políticas de cancelación (`app/payments/cancellations.py`)
+
+Las edita `FINANCE_ADMIN` (`GET/POST /api/v1/admin/cancellation-policies`); una política nueva cierra la anterior del mismo escenario y la base no permite traslapes. **Sin política vigente, cancelar no cuesta.**
+
+| Escenario | Cuándo | Qué pasa con el dinero |
+|---|---|---|
+| `CLIENT_LATE_CANCEL` | El cliente cancela ya aceptada o agendada, antes de que el técnico salga | Se anula la reserva; si hay cargo, se cobra aparte (pago `CANCELLATION_FEE`) con la tarjeta que eligió. Sin tarjeta elegida: alerta `cancellation_fee.not_collected` |
+| `CLIENT_CANCEL_ON_SITE` | El técnico ya salió ("en camino") | Captura parcial de la reserva por el cargo por visita; la orden queda `CANCELLED` con motivo `CLIENT_CANCELLED_ON_SITE` |
+
+El cargo (`FIXED` en centavos sin IVA o `PERCENT` del precio) lleva IVA y retenciones y se reparte según `technician_share_bp`. Se rechaza una política cuyo reparto dejaría al técnico en negativo tras impuestos. El técnico que se retira no paga cargo (cuenta en su confiabilidad).
+
+### 15.5 Contracargos (`app/payments/disputes.py`)
+
+- `charge.dispute.created` → pago `DISPUTED`, registro en `payment_disputes` con monto, motivo y fecha límite, alerta a finanzas. **Sin descuento al técnico** (D9).
+- `GET /api/v1/admin/disputes` (bandeja por fecha límite) y `POST /api/v1/admin/disputes/{id}/evidence` (`DISPUTES_MANAGE`): el sistema arma el expediente con lo que ya tiene (descripción del servicio, precio, fechas de aceptación, salida, inicio, término, aprobación y captura) más la nota de finanzas, **sin datos personales ni del KYC**, y lo envía a Stripe. No se admite fuera de plazo ni dos veces.
+- Ganado → el pago vuelve a `PAID` (o `PARTIALLY_REFUNDED`).
+- Perdido → `CHARGED_BACK`; se revierte al técnico su parte proporcional (`Idempotency-Key dispute-reversal:{id}`); si no tiene saldo, la plataforma lo absorbe y se alerta; asientos `CHARGEBACK` y métrica de riesgo (`risk.chargeback_lost`).
+
+### 15.6 Estado de cuenta del técnico
+
+| Ruta | Qué devuelve |
+|---|---|
+| `GET /api/v1/technicians/me/earnings` | Por orden: precio, comisión, IVA, retenciones, neto, ajustes (lo recuperado por reembolsos o contracargos) y neto final, con totales |
+| `GET /api/v1/technicians/me/payouts` | Sus depósitos (llegan por webhook `payout.*`) |
+| `GET /api/v1/technicians/me/balance` | Saldo disponible y pendiente en su cuenta de Stripe |
+
+### 15.7 Webhooks
+
+Ahora se procesan `refund.*` (confirman o fallan reembolsos; uno hecho en el panel de Stripe se registra como `OUTSIDE_APP`) y `charge.dispute.*`. `charge.refunded`, `charge.updated`, `transfer.reversed` y `charge.dispute.funds_*` se ignoran porque ya los cubren los anteriores.
+
+### 15.8 Pruebas
+
+`tests/test_payments_refunds.py`: trigger, reparto por política, solicitud del cliente con sus validaciones, aprobación y asientos, rechazo, plazo, doble firma con los tres casos (quien pide, operador sin permiso alto y administradora), una firma abajo del umbral con idempotencia, permisos, técnico sin saldo, Stripe caído con reintento, confirmación por webhook, reembolso fuera de la app, disputas con captura parcial y con reembolso, cancelación en sitio, cancelación tardía con y sin tarjeta, sin política, administración de políticas, contracargo abierto, evidencia y perdido con reversión, ganado, perdido sin saldo, evidencia fuera de plazo, y ganancias, depósitos y saldo del técnico. En `tests/test_payments_provider.py`, los parámetros exactos de reembolsos, captura parcial, disputas, reversión y saldo.
+
+### 15.9 Limitaciones conocidas
+
+- **"El técnico absorbe todo"** (una de las opciones del doc) necesitaría una reversión adicional de transferencia; hoy los motivos reparten proporcionalmente o los absorbe la plataforma.
+- **Comisión de disputa de Stripe:** no se asienta todavía (`PROVIDER_FEES`); hay que leerla de la transacción de saldo.
+- **Un reembolso ya exitoso que después falla** (el banco lo rechaza) se alerta a finanzas y no se revierte solo.
+- Pagos `ADJUSTMENT` (trabajo adicional aprobado por el cliente): el modelo los admite, falta su flujo en la app.

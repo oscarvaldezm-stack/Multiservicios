@@ -133,6 +133,9 @@ class Settings(BaseSettings):
     WEBHOOK_MAX_ATTEMPTS: int = Field(default=8, ge=1, le=20)           # después: DEAD y alerta a finanzas
     RECONCILIATION_WINDOW_HOURS: int = Field(default=48, ge=24, le=24 * 14)
     RECONCILIATION_INTERVAL_HOURS: int = Field(default=24, ge=1, le=24 * 7)
+    # --- Pagos (Fase 5) -----------------------------------------------------------------------
+    # D8: reembolsos arriba de este monto (lo que se devuelve al cliente) requieren una segunda firma.
+    REFUND_DOUBLE_APPROVAL_CENTS: int = Field(default=200_000, ge=0)
     # Adónde vuelve el técnico al terminar (o al vencer) el formulario de Stripe. HTTPS en producción.
     STRIPE_CONNECT_RETURN_URL: str = "http://localhost:3000/pagos/cuenta/listo"
     STRIPE_CONNECT_REFRESH_URL: str = "http://localhost:3000/pagos/cuenta/reintentar"

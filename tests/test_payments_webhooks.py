@@ -189,18 +189,14 @@ def test_modo_distinto_al_de_las_claves_se_ignora(client, db):
     assert stored(db, ev["id"]).last_error == "LIVEMODE_MISMATCH"
 
 
-@pytest.mark.parametrize("type_,alert", [("charge.dispute.created", "payment.dispute_opened"),
-                                         ("charge.refunded", "payment.refunded_outside_app"),
-                                         ("refund.updated", None), ("customer.created", None)])
-def test_eventos_de_fases_posteriores_o_ajenos(client, db, type_, alert):
+@pytest.mark.parametrize("type_,note", [("charge.refunded", "NOT_NEEDED"), ("transfer.reversed", "NOT_NEEDED"),
+                                        ("customer.created", "UNHANDLED_EVENT_TYPE")])
+def test_eventos_que_no_hace_falta_procesar(client, db, type_, note):
     ev = event(type_, "obj_1", object_type="x")
     post(client, PLATFORM, ev)
     work(db)
     row = stored(db, ev["id"])
-    assert row.status == W.IGNORED
-    assert row.last_error == ("UNHANDLED_EVENT_TYPE" if type_ == "customer.created" else "DEFERRED_PHASE_5")
-    if alert:
-        assert outbox(db, alert) == 1
+    assert row.status == W.IGNORED and row.last_error == note
 
 
 def test_reintentos_con_espera_creciente_y_dead(client, db, category, people, fake):

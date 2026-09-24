@@ -8,7 +8,8 @@ de este módulo. Agregar Mercado Pago = un adaptador nuevo, sin tocar tablas ni 
 Fase 2: cuentas conectadas del técnico, cliente del proveedor y guardado de tarjeta.
 Fase 3: autorizar (captura manual con cargo de destino), capturar, anular y consultar un cobro.
 Fase 4: verificar webhooks, consultar depósitos al técnico y listar cobros para la conciliación.
-La Fase 5 agrega refund / disputes a este mismo contrato.
+Fase 5: reembolsos (quién los absorbe), captura parcial con su comisión, contracargos (consulta,
+evidencia), reversión de la transferencia al técnico y saldo de su cuenta.
 """
 from __future__ import annotations
 
@@ -151,6 +152,44 @@ class PayoutInfo:
     failure_code: str | None = None
 
 
+@dataclass(frozen=True)
+class RefundRequest:
+    refund_id: uuid.UUID               # nuestro id: Idempotency-Key refund:{id}
+    provider_payment_id: str
+    amount_cents: int
+    reverse_transfer: bool             # recuperar del técnico la parte proporcional de lo transferido
+    refund_application_fee: bool       # devolver la parte proporcional de la comisión (exige reverse_transfer)
+    duplicate: bool = False
+
+
+@dataclass(frozen=True)
+class RefundInfo:
+    provider_refund_id: str
+    provider_payment_id: str | None
+    amount_cents: int
+    status: str                        # pending, succeeded, failed, canceled, requires_action
+    failure_reason: str | None = None
+    transfer_reversed: bool = False
+    metadata_refund_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DisputeInfo:
+    provider_dispute_id: str
+    provider_payment_id: str | None
+    amount_cents: int
+    reason: str | None
+    status: str                        # warning_needs_response, needs_response, under_review, won, lost...
+    evidence_due_by: datetime | None = None
+
+
+@dataclass(frozen=True)
+class BalanceInfo:
+    available_cents: int
+    pending_cents: int
+    currency: str
+
+
 class PaymentProvider(abc.ABC):
     name: str
     capabilities: Capabilities
@@ -191,8 +230,12 @@ class PaymentProvider(abc.ABC):
         """
 
     @abc.abstractmethod
-    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int) -> ProviderPayment:
-        """Cobra lo autorizado (idempotente por pago: nunca dos capturas)."""
+    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int,
+                application_fee_cents: int | None = None) -> ProviderPayment:
+        """
+        Cobra lo autorizado (idempotente por pago: nunca dos capturas). En una captura parcial se
+        manda la comisión recalculada sobre lo capturado; el resto de la reserva se libera solo.
+        """
 
     @abc.abstractmethod
     def cancel_authorization(self, provider_payment_id: str, payment_id: uuid.UUID) -> ProviderPayment:
@@ -217,3 +260,28 @@ class PaymentProvider(abc.ABC):
     @abc.abstractmethod
     def list_payments(self, created_from: datetime, created_to: datetime) -> list[ProviderPayment]:
         """Cobros creados en el periodo (para detectar los que existen solo en el proveedor)."""
+
+    # ---------------------------------------------------------------- reembolsos, disputas y saldo (Fase 5)
+    @abc.abstractmethod
+    def refund(self, req: RefundRequest) -> RefundInfo:
+        """Reembolso total o parcial. Idempotente por reembolso (refund:{id})."""
+
+    @abc.abstractmethod
+    def get_refund(self, provider_refund_id: str) -> RefundInfo:
+        """Estado real de un reembolso."""
+
+    @abc.abstractmethod
+    def get_dispute(self, provider_dispute_id: str) -> DisputeInfo:
+        """Estado real de un contracargo."""
+
+    @abc.abstractmethod
+    def submit_dispute_evidence(self, provider_dispute_id: str, evidence: dict[str, str]) -> DisputeInfo:
+        """Envía el expediente de evidencia (texto; los archivos van por referencia)."""
+
+    @abc.abstractmethod
+    def reverse_transfer(self, provider_payment_id: str, amount_cents: int, key: str) -> str:
+        """Recupera de la cuenta del técnico parte de lo transferido. Idempotente por `key`."""
+
+    @abc.abstractmethod
+    def get_balance(self, provider_account_id: str) -> BalanceInfo:
+        """Saldo disponible y pendiente de la cuenta conectada del técnico."""

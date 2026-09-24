@@ -380,3 +380,13 @@ def close_rule(db: Session, actor: Actor, rule_id: int, *, valid_to: datetime | 
     write_audit(db, action="finance.commission_rule.closed", actor=actor, target_type="commission_rule",
                 target_id=str(rule.id), changes={"valid_to": valid_to.isoformat()}, ctx=ctx)
     return rule
+
+
+def price_for_charge(charge_cents: int, service_tax_bp: int) -> int:
+    """El mayor precio (sin IVA) cuyo cobro con IVA no excede `charge_cents` (para capturas parciales)."""
+    price = charge_cents * BP // (BP + service_tax_bp)
+    while price > 0 and price + apply_bp(price, service_tax_bp) > charge_cents:
+        price -= 1
+    while price + 1 + apply_bp(price + 1, service_tax_bp) <= charge_cents:
+        price += 1
+    return price

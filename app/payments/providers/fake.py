@@ -17,12 +17,16 @@ from app.payments.providers.base import (
     AccountPrefill,
     AccountStatusInfo,
     AuthorizationRequest,
+    BalanceInfo,
+    DisputeInfo,
     Capabilities,
     OnboardingLink,
     PaymentProvider,
     ProviderError,
     PayoutInfo,
     ProviderPayment,
+    RefundInfo,
+    RefundRequest,
     SavedCard,
     SetupIntentInfo,
     WebhookEvent,
@@ -53,6 +57,13 @@ class FakePaymentProvider(PaymentProvider):
         self._fingerprints: dict[str, str] = {}
         self.decline_next: str | None = None        # "card_declined", "insufficient_funds", "authentication_required"
         self.payouts: dict[tuple[str, str], PayoutInfo] = {}
+        self.refunds: dict[str, dict] = {}
+        self._refund_by_id: dict[uuid.UUID, str] = {}
+        self.refund_status_next: str = "succeeded"   # "pending" / "failed" para simular a Stripe
+        self.disputes: dict[str, DisputeInfo] = {}
+        self.evidence: dict[str, dict] = {}
+        self.reversals: dict[str, tuple[str, int]] = {}
+        self.balances: dict[str, BalanceInfo] = {}
 
     def _enter(self, op: str) -> None:
         self.calls.append(op)
@@ -166,14 +177,18 @@ class FakePaymentProvider(PaymentProvider):
         """Simula que el cliente completó 3D Secure en la app."""
         self.intents[provider_payment_id].update(status=PaymentStatus.AUTHORIZED, failure_code=None)
 
-    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int) -> ProviderPayment:
+    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int,
+                application_fee_cents: int | None = None) -> ProviderPayment:
         self._enter("payment_intents.capture")
         i = self.intents[provider_payment_id]
         if i["status"] == PaymentStatus.PAID:                           # idempotencia capture:{pago}
             return self._view(provider_payment_id)
-        if i["status"] != PaymentStatus.AUTHORIZED or amount_cents > i["amount"]:
+        if i["status"] != PaymentStatus.AUTHORIZED or not 0 < amount_cents <= i["amount"]:
             raise ProviderError("No se puede capturar", code="PAYMENT_PROVIDER_REJECTED")
-        i.update(status=PaymentStatus.PAID, received=amount_cents, captures=i["captures"] + 1)
+        if application_fee_cents is not None and not 0 <= application_fee_cents <= amount_cents:
+            raise ProviderError("Comisión inválida", code="PAYMENT_PROVIDER_REJECTED")
+        i.update(status=PaymentStatus.PAID, received=amount_cents, captures=i["captures"] + 1,
+                 captured_fee=application_fee_cents)
         return self._view(provider_payment_id)
 
     def cancel_authorization(self, provider_payment_id: str, payment_id: uuid.UUID) -> ProviderPayment:
@@ -227,3 +242,79 @@ class FakePaymentProvider(PaymentProvider):
                              "failure_code": None, "fingerprint": None, "client_secret": f"{pid}_secret_x",
                              "captures": 1, "created": datetime.now(timezone.utc)}
         return pid
+
+    # ------------------------------------------------------------------ reembolsos, disputas y saldo (Fase 5)
+    def refund(self, req: RefundRequest) -> RefundInfo:
+        self._enter("refunds.create")
+        if req.refund_id in self._refund_by_id:                          # idempotencia refund:{id}
+            return self.get_refund(self._refund_by_id[req.refund_id])
+        i = self.intents.get(req.provider_payment_id)
+        already = sum(r["amount"] for r in self.refunds.values()
+                      if r["pi"] == req.provider_payment_id and r["status"] in ("pending", "succeeded"))
+        if i is None or i["status"] != PaymentStatus.PAID or already + req.amount_cents > i["received"]:
+            raise ProviderError("Reembolso inválido", code="PAYMENT_PROVIDER_REJECTED")
+        if req.refund_application_fee and not req.reverse_transfer:
+            raise ProviderError("La comisión solo se devuelve revirtiendo la transferencia",
+                                code="PAYMENT_PROVIDER_REJECTED")
+        if req.reverse_transfer:
+            acct = i["request"].destination_account_id if i.get("request") else None
+            bal = self.balances.get(acct)
+            if bal is not None and bal.available_cents <= 0:              # el técnico ya retiró su saldo
+                raise ProviderError("Saldo insuficiente del técnico", code="PAYMENT_PROVIDER_REJECTED",
+                                    provider_code="balance_insufficient")
+        rid = f"re_fake{secrets.token_hex(8)}"
+        self.refunds[rid] = {"pi": req.provider_payment_id, "amount": req.amount_cents,
+                             "status": self.refund_status_next, "reverse": req.reverse_transfer,
+                             "fee": req.refund_application_fee, "refund_id": str(req.refund_id)}
+        self._refund_by_id[req.refund_id] = rid
+        return self.get_refund(rid)
+
+    def refund_outside_app(self, provider_payment_id: str, amount_cents: int) -> str:
+        """Reembolso hecho desde el panel de Stripe (sin pasar por nuestra app)."""
+        rid = f"re_fake{secrets.token_hex(8)}"
+        self.refunds[rid] = {"pi": provider_payment_id, "amount": amount_cents, "status": "succeeded",
+                             "reverse": False, "fee": False, "refund_id": None}
+        return rid
+
+    def get_refund(self, provider_refund_id: str) -> RefundInfo:
+        r = self.refunds[provider_refund_id]
+        return RefundInfo(provider_refund_id=provider_refund_id, provider_payment_id=r["pi"],
+                          amount_cents=r["amount"], status=r["status"],
+                          failure_reason="declined" if r["status"] == "failed" else None,
+                          transfer_reversed=r["reverse"], metadata_refund_id=r["refund_id"])
+
+    def set_refund(self, provider_refund_id: str, status: str) -> None:
+        self.refunds[provider_refund_id]["status"] = status
+
+    def open_dispute(self, provider_payment_id: str, amount_cents: int, reason: str = "fraudulent") -> str:
+        did = f"dp_fake{secrets.token_hex(6)}"
+        self.disputes[did] = DisputeInfo(provider_dispute_id=did, provider_payment_id=provider_payment_id,
+                                         amount_cents=amount_cents, reason=reason, status="needs_response",
+                                         evidence_due_by=datetime.now(timezone.utc) + timedelta(days=7))
+        return did
+
+    def close_dispute(self, provider_dispute_id: str, *, won: bool) -> None:
+        self.disputes[provider_dispute_id] = replace(self.disputes[provider_dispute_id],
+                                                     status="won" if won else "lost")
+
+    def get_dispute(self, provider_dispute_id: str) -> DisputeInfo:
+        self._enter("disputes.retrieve")
+        return self.disputes[provider_dispute_id]
+
+    def submit_dispute_evidence(self, provider_dispute_id: str, evidence: dict[str, str]) -> DisputeInfo:
+        self._enter("disputes.update")
+        self.evidence[provider_dispute_id] = dict(evidence)
+        self.disputes[provider_dispute_id] = replace(self.disputes[provider_dispute_id], status="under_review")
+        return self.disputes[provider_dispute_id]
+
+    def reverse_transfer(self, provider_payment_id: str, amount_cents: int, key: str) -> str:
+        self._enter("transfers.reversals.create")
+        if key in self.reversals:                                       # idempotencia por llave
+            return self.reversals[key][0]
+        trr = f"trr_fake{secrets.token_hex(6)}"
+        self.reversals[key] = (trr, amount_cents)
+        return trr
+
+    def get_balance(self, provider_account_id: str) -> BalanceInfo:
+        self._enter("balance.retrieve")
+        return self.balances.get(provider_account_id, BalanceInfo(available_cents=0, pending_cents=0, currency="MXN"))

@@ -28,12 +28,16 @@ from app.payments.providers.base import (
     AccountPrefill,
     AccountStatusInfo,
     AuthorizationRequest,
+    BalanceInfo,
+    DisputeInfo,
     Capabilities,
     OnboardingLink,
     PaymentProvider,
     ProviderError,
     PayoutInfo,
     ProviderPayment,
+    RefundInfo,
+    RefundRequest,
     SavedCard,
     SetupIntentInfo,
     WebhookEvent,
@@ -263,10 +267,13 @@ class StripePaymentProvider(PaymentProvider):
             self._translate("payment_intents.create", exc)
         return self._to_payment(pi)
 
-    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int) -> ProviderPayment:
+    def capture(self, provider_payment_id: str, payment_id: uuid.UUID, amount_cents: int,
+                application_fee_cents: int | None = None) -> ProviderPayment:
+        params: dict[str, Any] = {"amount_to_capture": amount_cents, "expand": ["latest_charge"]}
+        if application_fee_cents is not None:
+            params["application_fee_amount"] = application_fee_cents     # comisión recalculada (captura parcial)
         pi = self._call("payment_intents.capture", self._c.v1.payment_intents.capture, provider_payment_id,
-                        params={"amount_to_capture": amount_cents, "expand": ["latest_charge"]},
-                        options={"idempotency_key": f"capture:{payment_id}"})
+                        params=params, options={"idempotency_key": f"capture:{payment_id}"})
         return self._to_payment(pi)
 
     def cancel_authorization(self, provider_payment_id: str, payment_id: uuid.UUID) -> ProviderPayment:
@@ -298,3 +305,64 @@ class StripePaymentProvider(PaymentProvider):
             "created": {"gte": int(created_from.timestamp()), "lt": int(created_to.timestamp())}, "limit": 100})
         items = page.auto_paging_iter() if hasattr(page, "auto_paging_iter") else (_get(page, "data") or [])
         return [self._to_payment(pi) for pi in items]
+
+    # ------------------------------------------------------------------ reembolsos, disputas y saldo (Fase 5)
+    @staticmethod
+    def _to_refund(r: Any) -> RefundInfo:
+        return RefundInfo(provider_refund_id=r["id"], provider_payment_id=_get(r, "payment_intent"),
+                          amount_cents=int(_get(r, "amount") or 0), status=str(_get(r, "status")),
+                          failure_reason=_get(r, "failure_reason"),
+                          transfer_reversed=_get(r, "transfer_reversal") is not None,
+                          metadata_refund_id=_get(r, "metadata", "refund_id"))
+
+    def refund(self, req: RefundRequest) -> RefundInfo:
+        r = self._call("refunds.create", self._c.v1.refunds.create, params={
+            "payment_intent": req.provider_payment_id,
+            "amount": req.amount_cents,
+            "reverse_transfer": req.reverse_transfer,
+            "refund_application_fee": req.refund_application_fee,
+            "reason": "duplicate" if req.duplicate else "requested_by_customer",
+            "metadata": {"refund_id": str(req.refund_id)},
+        }, options={"idempotency_key": f"refund:{req.refund_id}"})
+        return self._to_refund(r)
+
+    def get_refund(self, provider_refund_id: str) -> RefundInfo:
+        return self._to_refund(self._call("refunds.retrieve", self._c.v1.refunds.retrieve, provider_refund_id))
+
+    @staticmethod
+    def _to_dispute(d: Any) -> DisputeInfo:
+        due = _get(d, "evidence_details", "due_by")
+        return DisputeInfo(provider_dispute_id=d["id"], provider_payment_id=_get(d, "payment_intent"),
+                           amount_cents=int(_get(d, "amount") or 0), reason=_get(d, "reason"),
+                           status=str(_get(d, "status")),
+                           evidence_due_by=datetime.fromtimestamp(due, timezone.utc) if due else None)
+
+    def get_dispute(self, provider_dispute_id: str) -> DisputeInfo:
+        return self._to_dispute(self._call("disputes.retrieve", self._c.v1.disputes.retrieve, provider_dispute_id))
+
+    def submit_dispute_evidence(self, provider_dispute_id: str, evidence: dict[str, str]) -> DisputeInfo:
+        d = self._call("disputes.update", self._c.v1.disputes.update, provider_dispute_id,
+                       params={"evidence": evidence, "submit": True})
+        return self._to_dispute(d)
+
+    def reverse_transfer(self, provider_payment_id: str, amount_cents: int, key: str) -> str:
+        pi = self._call("payment_intents.retrieve", self._c.v1.payment_intents.retrieve, provider_payment_id,
+                        params={"expand": ["latest_charge"]})
+        transfer = _get(pi, "latest_charge", "transfer")
+        if not transfer:
+            raise ProviderError("El cobro no tiene transferencia al técnico", code="PAYMENT_PROVIDER_REJECTED")
+        rev = self._call("transfers.reversals.create", self._c.v1.transfers.reversals.create,
+                         transfer if isinstance(transfer, str) else transfer["id"],
+                         params={"amount": amount_cents}, options={"idempotency_key": key})
+        return rev["id"]
+
+    def get_balance(self, provider_account_id: str) -> BalanceInfo:
+        b = self._call("balance.retrieve", self._c.v1.balance.retrieve,
+                       options={"stripe_account": provider_account_id})
+        cur = self._s.PAYMENT_CURRENCY.lower()
+
+        def total(kind: str) -> int:
+            return sum(int(_get(x, "amount") or 0) for x in (_get(b, kind) or []) if _get(x, "currency") == cur)
+
+        return BalanceInfo(available_cents=total("available"), pending_cents=total("pending"),
+                           currency=self._s.PAYMENT_CURRENCY)

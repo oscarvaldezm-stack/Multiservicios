@@ -279,9 +279,10 @@ def test_disputa_con_reembolso_total_no_es_calificable(client, db, category, peo
     fin = auth(login(client, "finanzas@example.com").json()["access_token"])
     r = client.post(f"{API}/admin/orders/{oid}/dispute-resolution", headers=fin,
                     json={"outcome": "FULL_REFUND", "note": "El técnico no se presentó"})
-    assert r.status_code == 200 and r.json()["status"] == "DISPUTED"      # espera la confirmación del proveedor
-    webhook(db, oid, "refunded", amount=payment_of(db, oid).captured_cents)
-    assert order_status(db, oid) == "REFUNDED"
+    # Fase 5: el reembolso se ejecuta en el proveedor y, al confirmarse, la orden queda REFUNDED.
+    assert r.status_code == 200 and r.json()["status"] == "REFUNDED"
+    p = payment_of(db, oid)
+    assert p is None or p.status.value == "REFUNDED"
     from app.models import TechnicianReputation
     db.expire_all()
     assert db.get(TechnicianReputation, tid).disputes_lost == 1

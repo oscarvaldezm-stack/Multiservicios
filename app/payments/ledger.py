@@ -69,6 +69,22 @@ def post_refund(db: Session, payment: Payment, amount_cents: int, entry_type: st
     return post(db, payment, entry_type, {A.CUSTOMER: amount_cents, A.REFUNDS: -amount_cents})
 
 
+def post_refund_allocation(db: Session, payment: Payment, refund, entry_type: str = "REFUND") -> uuid.UUID:
+    """
+    Reembolso con su reparto (Fase 5): el cliente recupera el monto; el técnico devuelve su parte
+    si se revirtió la transferencia; la plataforma devuelve comisión, IVA y retenciones si se devolvió
+    la comisión, y absorbe el resto (REFUNDS = costo de la plataforma).
+    """
+    return post(db, payment, entry_type, {
+        A.CUSTOMER: refund.amount_cents,
+        A.TECHNICIAN_PAYABLE: -refund.technician_recovered_cents,
+        A.PLATFORM_REVENUE: -refund.commission_returned_cents,
+        A.VAT_PAYABLE: -refund.vat_returned_cents,
+        A.TAX_WITHHELD: -refund.withholding_returned_cents,
+        A.REFUNDS: -refund.platform_absorbed_cents,
+    })
+
+
 def balance(db: Session, account: LedgerAccount, *, payment_id: uuid.UUID | None = None,
             since: datetime | None = None, until: datetime | None = None) -> int:
     stmt = select(func.coalesce(func.sum(LedgerEntry.amount_cents), 0)).where(LedgerEntry.account == account)

@@ -13,6 +13,7 @@ Procesamiento (este módulo, desde el worker):
   dejar un estado incorrecto.
 - Cada evento corre en su propio savepoint: si falla, suma un intento y se reintenta con espera
   creciente; al llegar a WEBHOOK_MAX_ATTEMPTS pasa a DEAD y se alerta a finanzas.
+- Reembolsos (refund.*) y contracargos (charge.dispute.*) se aplican con sus módulos (Fase 5).
 - Del evento solo se guarda lo mínimo (id, tipo, objeto, cuenta, modo): nada de correos,
   nombres ni datos de facturación.
 """
@@ -45,11 +46,9 @@ from app.payments.providers.base import PaymentProvider, ProviderError, WebhookE
 log = logging.getLogger("payments")
 W = WebhookEventStatus
 
-# Eventos cuya lógica llega en la Fase 5 (reembolsos y disputas): se guardan y se alerta, no se pierden.
-DEFERRED_PREFIXES = ("charge.refunded", "refund.", "charge.dispute.", "transfer.reversed", "charge.updated")
-ALERT_ON_DEFERRED = {"charge.dispute.created": "payment.dispute_opened",
-                     "charge.dispute.funds_withdrawn": "payment.dispute_opened",
-                     "charge.refunded": "payment.refunded_outside_app"}
+# Eventos que no hace falta procesar: los cubren refund.* o no cambian nada nuestro.
+NOT_NEEDED = ("charge.refunded", "charge.updated", "transfer.reversed", "charge.dispute.funds_withdrawn",
+              "charge.dispute.funds_reinstated")
 _PAYOUT_STATUS = {"pending": PayoutStatus.PENDING, "in_transit": PayoutStatus.IN_TRANSIT, "paid": PayoutStatus.PAID,
                   "failed": PayoutStatus.FAILED, "canceled": PayoutStatus.CANCELED}
 
@@ -148,13 +147,31 @@ def _handle(db: Session, ev: PaymentWebhookEvent, provider: PaymentProvider) -> 
         return _on_deauthorized(db, ev.account_id)
     if t.startswith("payout."):
         return _on_payout(db, ev.account_id, object_id, provider)
-    if t.startswith(DEFERRED_PREFIXES):
-        if t in ALERT_ON_DEFERRED:
-            db.add(OutboxEvent(event_type=ALERT_ON_DEFERRED[t], aggregate_type="payment_webhook_event",
-                               aggregate_id=uuid.uuid5(uuid.NAMESPACE_URL, f"webhook:{ev.id}"),
-                               payload={"event_id": ev.provider_event_id, "object_id": object_id}))
-        return W.IGNORED, "DEFERRED_PHASE_5"
+    if t in NOT_NEEDED:
+        return W.IGNORED, "NOT_NEEDED"
+    if t.startswith("refund.") or t == "charge.refund.updated":
+        return _on_refund(db, object_id, provider)
+    if t.startswith("charge.dispute."):
+        return _on_dispute(db, object_id, provider)
     return W.IGNORED, "UNHANDLED_EVENT_TYPE"
+
+
+def _on_refund(db: Session, object_id: str | None, provider: PaymentProvider):
+    from app.payments import refunds
+
+    if not object_id:
+        return W.IGNORED, "MISSING_OBJECT"
+    row = refunds.apply_provider_refund(db, provider.get_refund(object_id))
+    return (W.PROCESSED, None) if row is not None else (W.IGNORED, "UNKNOWN_PAYMENT")
+
+
+def _on_dispute(db: Session, object_id: str | None, provider: PaymentProvider):
+    from app.payments import disputes
+
+    if not object_id:
+        return W.IGNORED, "MISSING_OBJECT"
+    row = disputes.sync_from_provider(db, provider.get_dispute(object_id), provider)
+    return (W.PROCESSED, None) if row is not None else (W.IGNORED, "UNKNOWN_PAYMENT")
 
 
 def _find_payment(db: Session, provider_payment_id: str | None, metadata_payment_id: str | None) -> Payment | None:

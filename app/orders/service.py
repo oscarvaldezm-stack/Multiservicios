@@ -27,7 +27,8 @@ from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.orders.state_machine import PRE_START, OrderError, lock_order, transition
 from app.payments import service as payments
-from app.payments.commission import from_cents, to_cents
+from app.payments import refunds
+from app.payments.commission import from_cents, price_for_charge, to_cents
 from app.models import (
     PAYMENT_CONFIRMED,
     OrderStatus,
@@ -140,8 +141,13 @@ def cancel(db: Session, user: User, order_id: uuid.UUID, reason: str | None,
     order = get_for_user(db, user, order_id, lock=True)
     if user.role == UserRole.TECHNICIAN:
         raise OrderError("El técnico no cancela: se retira de la orden", code="ORDER_USE_WITHDRAW")
-    transition(db, order, O.CANCELLED, _actor(user), reason_code="CLIENT_CANCELLED", note=reason, ctx=ctx)
-    payments.cancel_for_order(db, order)
+    from app.payments import cancellations
+
+    scenario = cancellations.scenario_for(order, payments.active_payment(db, order.id))
+    reason_code = "CLIENT_CANCELLED_ON_SITE" if scenario == cancellations.ON_SITE else "CLIENT_CANCELLED"
+    transition(db, order, O.CANCELLED, _actor(user), reason_code=reason_code, note=reason, ctx=ctx)
+    # Política de cancelación vigente: sin cargo, cargo aparte o captura parcial por visita.
+    cancellations.apply_client_cancellation(db, order, scenario)
     return order
 
 
@@ -337,15 +343,29 @@ def resolve_dispute(db: Session, admin: Actor, order_id: uuid.UUID, outcome: str
         else:
             raise OrderError("No hay un pago que liberar", code="ORDER_NO_PAYMENT")
     elif outcome == "PARTIAL_REFUND":
-        if not captured or refund_cents is None or not (0 < refund_cents < refundable_cents):
-            raise DomainError("El reembolso parcial requiere un pago cobrado y un monto menor a lo que queda por reembolsar",
+        if payment is None or refund_cents is None:
+            raise DomainError("El reembolso parcial requiere un monto", code="ORDER_INVALID_REFUND", http_status=422)
+        if captured:
+            if not 0 < refund_cents < refundable_cents:
+                raise DomainError("El reembolso parcial debe ser menor a lo que queda por reembolsar",
+                                  code="ORDER_INVALID_REFUND", http_status=422)
+            # Falla del técnico: cada quien devuelve su parte (reembolsos, motivo SERVICE_DEFICIENT).
+            refunds.create_by_finance(db, admin, payment.id, amount_cents=refund_cents, reason_code="SERVICE_DEFICIENT",
+                                      note=note, source="DISPUTE", ctx=ctx)
+        elif payment.status == PaymentStatus.AUTHORIZED and 0 < refund_cents < payment.amount_cents:
+            # Aún sin cobrar: se captura solo lo que sí corresponde (servicio parcial); el resto se libera.
+            quote = payment.breakdown
+            price = price_for_charge(payment.amount_cents - refund_cents, quote.service_tax_bp)
+            payments.capture_partial(db, payment, price)
+        else:
+            raise DomainError("El reembolso parcial requiere un pago cobrado o autorizado y un monto válido",
                               code="ORDER_INVALID_REFUND", http_status=422)
-        db.add(_refund_request(payment.id, refund_cents))
         transition(db, order, after_payment, admin, reason_code="DISPUTE_PARTIAL_REFUND", note=note, ctx=ctx)
     elif outcome == "FULL_REFUND":
         if captured:
-            # El reembolso lo confirma el proveedor (webhook) → la orden pasa a REFUNDED en ese momento.
-            db.add(_refund_request(payment.id, refundable_cents))
+            # Se reembolsa lo que queda; al confirmarse, la orden pasa a REFUNDED (arriba del umbral, tras la 2a firma).
+            refunds.create_by_finance(db, admin, payment.id, amount_cents=None, reason_code="SERVICE_NOT_PROVIDED",
+                                      note=note, source="DISPUTE", ctx=ctx)
         else:
             payments.cancel_for_order(db, order)
             transition(db, order, O.CANCELLED, admin, reason_code="DISPUTE_FULL_REFUND", note=note, ctx=ctx)
@@ -358,11 +378,6 @@ def resolve_dispute(db: Session, admin: Actor, order_id: uuid.UUID, outcome: str
     _refresh_reputation(db, order.technician_id)
     db.flush()
     return order
-
-
-def _refund_request(payment_id: uuid.UUID, amount_cents: int) -> OutboxEvent:
-    return OutboxEvent(event_type="payment.refund_requested", aggregate_type="payment", aggregate_id=payment_id,
-                       payload={"amount_cents": amount_cents})
 
 
 # =============================================================================

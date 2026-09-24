@@ -302,7 +302,8 @@ def test_salvaguarda_24_h_antes_de_que_venza_la_autorizacion(client, db, categor
     assert order_status(db, oid) == "READY_FOR_REVIEW"
 
 
-def test_salvaguarda_con_disputa_no_cobra_y_alerta_una_vez(client, db, category, people):
+def test_salvaguarda_con_disputa_cobra_segun_d4(client, db, category, people):
+    """D4: con un reclamo abierto, se captura 24 h antes de vencer y la disputa se resuelve después."""
     _, th, _, ch = people
     oid = run_order(client, db, ch, th, category, until="AWAITING_APPROVAL")
     client.post(f"{ORDERS}/{oid}/dispute", headers=ch, json={"reason": "El trabajo quedó incompleto"})
@@ -313,8 +314,20 @@ def test_salvaguarda_con_disputa_no_cobra_y_alerta_una_vez(client, db, category,
         payments.enforce_capture_deadline(db)
         db.commit()
     capture_due(db)
-    assert payment_of(db, oid).status == P.AUTHORIZED and order_status(db, oid) == "DISPUTED"
-    assert events(db, "payment.authorization_expiring") == 1
+    assert payment_of(db, oid).status == P.PAID and order_status(db, oid) == "DISPUTED"
+    assert events(db, "payment.captured_under_dispute") == 1 and events(db, "payment.authorization_expiring") == 0
+
+
+def test_salvaguarda_con_trabajo_en_curso_solo_alerta(client, db, category, people):
+    _, th, _, ch = people
+    oid = run_order(client, db, ch, th, category, until="IN_PROGRESS")
+    db.execute(text("UPDATE payments SET capture_deadline = now() + interval '10 hours' WHERE service_order_id = :o"),
+               {"o": oid})
+    db.commit()
+    for _ in range(2):
+        payments.enforce_capture_deadline(db)
+        db.commit()
+    assert payment_of(db, oid).status == P.AUTHORIZED and events(db, "payment.authorization_expiring") == 1
 
 
 # ------------------------------------------------------------------ anulación

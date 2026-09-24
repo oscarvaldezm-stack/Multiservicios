@@ -38,7 +38,6 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.core.actor import Actor
 from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.models import (
@@ -129,8 +128,16 @@ def _record(db: Session, payment: Payment, type_: PaymentTransactionType, status
         .on_conflict_do_nothing(constraint="uq_payment_transactions_type_object"))
 
 
+def effective_breakdown(db: Session, payment: Payment) -> CommissionTransaction:
+    """El desglose de lo que realmente se cobró: el de la captura parcial si la hubo, si no el de la cotización."""
+    captured = db.scalar(select(CommissionTransaction).where(CommissionTransaction.payment_id == payment.id,
+                                                             CommissionTransaction.stage == "CAPTURE"))
+    return captured or _breakdown(db, payment)
+
+
 def _breakdown(db: Session, payment: Payment) -> CommissionTransaction:
-    b = db.scalar(select(CommissionTransaction).where(CommissionTransaction.payment_id == payment.id))
+    b = db.scalar(select(CommissionTransaction).where(CommissionTransaction.payment_id == payment.id,
+                                                      CommissionTransaction.stage == "QUOTE"))
     if b is None:
         raise PaymentError("El pago no tiene desglose de comisión", code="PAYMENT_BREAKDOWN_MISSING",
                            http_status=500)
@@ -281,7 +288,7 @@ def apply_provider_state(db: Session, payment: Payment, pp: ProviderPayment) -> 
         if before != P.AUTHORIZED:
             mark_authorized(db, payment, provider_payment_id=payment.provider_payment_id,
                             payment_method_fingerprint=pp.payment_method_fingerprint)
-        mark_captured(db, payment)
+        mark_captured(db, payment, pp.amount_received_cents or None)
     elif target == P.REQUIRES_ACTION and before == P.PENDING:
         move(payment, P.REQUIRES_ACTION)
         db.add(OutboxEvent(event_type="payment.action_required", aggregate_type="payment", aggregate_id=payment.id,
@@ -373,6 +380,52 @@ def capture(db: Session, payment: Payment, provider: PaymentProvider | None = No
     return payment
 
 
+def quote_terms(quote: CommissionTransaction) -> tuple[RuleTerms, TaxRates]:
+    """Regla y tasas congeladas en la cotización (para recalcular una captura parcial con las mismas)."""
+    from app.models import CommissionScope, CommissionType
+
+    scope = CommissionScope(quote.rule_scope) if quote.rule_scope in CommissionScope.__members__ else \
+        CommissionScope.GLOBAL
+    terms = RuleTerms(scope=scope, type=CommissionType(quote.rule_type or "PERCENT"), rate_bp=quote.rate_bp,
+                      fixed_cents=quote.fixed_cents, min_cents=quote.min_cents, max_cents=quote.max_cents,
+                      rule_id=quote.rule_id)
+    taxes = TaxRates(service_tax_bp=quote.service_tax_bp, commission_tax_bp=quote.commission_tax_bp,
+                     isr_withholding_bp=quote.isr_withholding_bp, iva_withholding_bp=quote.iva_withholding_bp,
+                     technician_has_rfc=quote.technician_has_rfc)
+    return terms, taxes
+
+
+def capture_partial(db: Session, payment: Payment, price_cents: int, *, terms: RuleTerms | None = None,
+                    provider: PaymentProvider | None = None) -> Payment:
+    """
+    Cobra solo una parte de lo autorizado (cargo por visita, servicio parcial). El desglose se
+    recalcula sobre el precio cobrado con la regla y tasas de la cotización (o con `terms`, p. ej.
+    el reparto de una política de cancelación) y se manda al proveedor la comisión correspondiente.
+    """
+    if payment.status != P.AUTHORIZED or not payment.provider_payment_id:
+        raise PaymentError("Solo se captura un pago autorizado", code="PAYMENT_INVALID_TRANSITION")
+    quote = _breakdown(db, payment)
+    base_terms, taxes = quote_terms(quote)
+    b = compute(price_cents, terms or base_terms, taxes)
+    if b.charge_cents >= payment.amount_cents:
+        return capture(db, payment, provider)
+    t = b.terms
+    db.add(CommissionTransaction(
+        payment_id=payment.id, stage="CAPTURE", rule_id=t.rule_id, rule_scope=t.scope.value, rule_type=t.type.value,
+        rate_bp=t.rate_bp, fixed_cents=t.fixed_cents, min_cents=t.min_cents, max_cents=t.max_cents,
+        service_tax_bp=taxes.service_tax_bp, commission_tax_bp=taxes.commission_tax_bp,
+        isr_withholding_bp=taxes.isr_withholding_bp, iva_withholding_bp=taxes.iva_withholding_bp,
+        technician_has_rfc=taxes.technician_has_rfc, price_cents=b.price_cents, service_tax_cents=b.service_tax_cents,
+        gross_cents=b.gross_cents, discount_cents=b.discount_cents, commission_cents=b.commission_cents,
+        commission_tax_cents=b.commission_tax_cents, withholding_isr_cents=b.withholding_isr_cents,
+        withholding_iva_cents=b.withholding_iva_cents, technician_cents=b.technician_cents))
+    db.flush()
+    result = _provider(provider).capture(payment.provider_payment_id, payment.id, b.charge_cents,
+                                         application_fee_cents=b.application_fee_cents)
+    apply_provider_state(db, payment, result)
+    return payment
+
+
 def capture_due(db: Session, provider: PaymentProvider | None = None, *, limit: int = 50) -> int:
     """Trabajo: captura los pagos AUTORIZADOS de órdenes que el cliente ya aprobó (o se aprobaron solas)."""
     ids = db.scalars(select(Payment.id).join(ServiceOrder, ServiceOrder.id == Payment.service_order_id).where(
@@ -397,8 +450,9 @@ def capture_due(db: Session, provider: PaymentProvider | None = None, *, limit: 
 def enforce_capture_deadline(db: Session, provider: PaymentProvider | None = None, now: datetime | None = None) -> int:
     """
     Salvaguarda de D5 + vencimiento: 24 h antes de que venza la autorización, si el cliente no ha
-    respondido, la orden se aprueba sola y se captura. Si el trabajo sigue en curso o hay una
-    disputa, se alerta a finanzas (decisión D4 pendiente) en lugar de cobrar.
+    respondido, la orden se aprueba sola y se captura. Con un reclamo abierto se aplica D4: se
+    captura igual (sin que se pierda el cobro) y la disputa se resuelve después con un reembolso
+    si procede. Si el trabajo sigue en curso, solo se alerta a finanzas.
     """
     from app.orders import service as orders
 
@@ -413,6 +467,18 @@ def enforce_capture_deadline(db: Session, provider: PaymentProvider | None = Non
             with db.begin_nested():
                 if orders.approve_before_authorization_expires(db, order_id):
                     done += 1
+        elif order_status == O.DISPUTED:
+            try:
+                with db.begin_nested():
+                    payment = db.scalar(select(Payment).where(Payment.id == payment_id).with_for_update()
+                                        .execution_options(populate_existing=True))
+                    capture(db, payment, provider)
+                    if payment.status == P.PAID:
+                        db.add(OutboxEvent(event_type="payment.captured_under_dispute", aggregate_type="payment",
+                                           aggregate_id=payment_id, payload={"order_id": str(order_id)}))
+                        done += 1
+            except ProviderError:
+                log.warning("No se pudo capturar el pago %s en disputa antes de vencer", payment_id)
         elif order_status != O.COMPLETED:
             already = db.scalar(select(OutboxEvent.id).where(OutboxEvent.aggregate_id == payment_id,
                                                              OutboxEvent.event_type == "payment.authorization_expiring"))
@@ -449,17 +515,25 @@ def mark_authorized(db: Session, payment: Payment, *, provider_payment_id: str,
         _record(db, payment, PaymentTransactionType.AUTHORIZATION, "succeeded")
 
 
-def mark_captured(db: Session, payment: Payment) -> None:
-    """payment_intent.succeeded: cobro completo; se asienta el reparto congelado."""
+def mark_captured(db: Session, payment: Payment, captured_cents: int | None = None) -> None:
+    """
+    payment_intent.succeeded: se asienta el reparto congelado. Una captura parcial (cargo por visita,
+    servicio parcial) usa su propio desglose, recalculado sobre lo cobrado; el resto de la reserva
+    se libera solo en el proveedor.
+    """
     from app.orders import service as orders
 
     if not move(payment, P.PAID):
         return
-    payment.captured_cents = payment.amount_cents
+    effective = effective_breakdown(db, payment)
+    payment.captured_cents = effective.gross_cents - effective.discount_cents
+    if captured_cents and captured_cents != payment.captured_cents:
+        log.error("Captura de %s centavos distinta al desglose (%s) en el pago %s", captured_cents,
+                  payment.captured_cents, payment.id)       # la conciliación lo alerta
     payment.captured_at = _now()
     db.flush()
     _record(db, payment, PaymentTransactionType.CAPTURE, "succeeded", amount_cents=payment.captured_cents)
-    ledger.post_capture(db, payment, _breakdown(db, payment))
+    ledger.post_capture(db, payment, effective)
     orders.on_payment_captured(db, payment.service_order_id)
 
 
@@ -491,25 +565,20 @@ def mark_failed(db: Session, payment: Payment, failure_code: str) -> None:
 
 
 def mark_refunded(db: Session, payment: Payment, amount_cents: int) -> None:
-    """Reembolso confirmado por el proveedor (monto de ESTE reembolso). Total si alcanza lo cobrado."""
-    from app.orders import service as orders
+    """
+    Reembolso confirmado por el proveedor que NO se pidió desde la app (p. ej. desde su panel):
+    se registra como OUTSIDE_APP (lo absorbe la plataforma) por el motor de reembolsos.
+    """
+    from app.payments import refunds
+    from app.payments.providers.base import RefundInfo
 
     if isinstance(amount_cents, bool) or not isinstance(amount_cents, int) or amount_cents <= 0:
         raise PaymentError("Monto de reembolso inválido", code="PAYMENT_INVALID_REFUND")
     if payment.status not in (P.PAID, P.PARTIALLY_REFUNDED, P.REFUNDED):
         raise PaymentError("Solo se reembolsa un pago cobrado", code="PAYMENT_INVALID_REFUND")
-    total = min(payment.captured_cents, payment.refunded_cents + amount_cents)
-    delta = total - payment.refunded_cents
-    if delta <= 0:
-        return                                          # ya estaba reembolsado por completo
-    full = total >= payment.captured_cents
-    move(payment, P.REFUNDED if full else P.PARTIALLY_REFUNDED)
-    payment.refunded_cents = total
-    payment.refunded_at = _now()
-    db.flush()
-    ledger.post_refund(db, payment, delta)
-    if full:
-        orders.on_full_refund(db, payment.service_order_id, Actor.system())
+    refunds.apply_provider_refund(db, RefundInfo(
+        provider_refund_id=f"re_ext_{uuid.uuid4().hex[:16]}", provider_payment_id=payment.provider_payment_id,
+        amount_cents=amount_cents, status="succeeded"))
 
 
 def mark_disputed(db: Session, payment: Payment) -> None:
@@ -519,15 +588,13 @@ def mark_disputed(db: Session, payment: Payment) -> None:
 
 
 def mark_dispute_closed(db: Session, payment: Payment, *, won: bool) -> None:
-    """charge.dispute.closed: ganada vuelve a su estado cobrado; perdida es CHARGED_BACK y se asienta."""
+    """charge.dispute.closed: ganada vuelve a su estado cobrado; perdida es CHARGED_BACK (app/payments/disputes.py)."""
     if payment.status != P.DISPUTED:
         return
     if won:
         move(payment, P.PARTIALLY_REFUNDED if payment.refunded_cents else P.PAID)
         db.flush()
         return
-    lost = payment.captured_cents - payment.refunded_cents
-    move(payment, P.CHARGED_BACK)
-    db.flush()
-    if lost > 0:
-        ledger.post_refund(db, payment, lost, entry_type="CHARGEBACK")
+    from app.payments.disputes import charge_back
+
+    charge_back(db, payment)

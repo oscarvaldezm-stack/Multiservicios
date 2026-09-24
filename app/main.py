@@ -14,6 +14,7 @@ from app.api.routes.kyc_catalogs import router as kyc_catalogs_router
 from app.api.routes import orders as orders_routes
 from app.api.routes import payments as payments_routes
 from app.api.routes import webhooks as webhooks_routes
+from app.api.routes import finance as finance_routes
 from app.api.routes import reviews as reviews_routes
 from app.api.routes.technician_kyc import router as technician_kyc_router
 from app.api.routes.users import admin_router, client_router, me_router, technician_router
@@ -71,7 +72,8 @@ for r in (auth_router, me_router, client_router, technician_router, admin_router
           orders_routes.router, orders_routes.client_router, orders_routes.tech_router, orders_routes.admin_router,
           reviews_routes.router, reviews_routes.admin_router,
           payments_routes.tech_router, payments_routes.client_router, payments_routes.admin_router,
-          webhooks_routes.router):
+          webhooks_routes.router, finance_routes.client_router, finance_routes.admin_router,
+          finance_routes.tech_router):
     app.include_router(r, prefix=settings.API_V1_PREFIX)
 
 
