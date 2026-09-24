@@ -213,3 +213,131 @@ class EarningsOut(BaseModel):
     total_net: Decimal
     total_adjustments: Decimal
     total_net_after_adjustments: Decimal
+
+
+# ------------------------------------------------------------------ Fase 6: panel de finanzas
+class SummaryOut(BaseModel):
+    """Montos en centavos (enteros exactos, como el libro)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from")
+    to: str
+    timezone: str
+    group_by: str
+    currency: str
+    totals: dict[str, int]
+    groups: list[dict]
+
+
+class AdminPaymentOut(BaseModel):
+    id: str
+    order_id: str
+    kind: str
+    status: str
+    currency: str
+    amount: Decimal
+    captured: Decimal
+    refunded: Decimal
+    failure_code: str | None
+    created_at: datetime
+    authorized_at: datetime | None
+    captured_at: datetime | None
+    capture_deadline: datetime | None
+
+
+class AdminPaymentDetailOut(AdminPaymentOut):
+    provider_payment_id: str | None
+    breakdowns: list[dict]
+    transactions: list[dict]
+    refunds: list[dict]
+    disputes: list[dict]
+    ledger: list[dict]
+
+
+class CommissionRuleIn(_In):
+    scope: str = Field(pattern=r"^(GLOBAL|CATEGORY|TECHNICIAN|PROMOTION)$")
+    scope_ref: str | None = Field(default=None, max_length=64)
+    type: str = Field(pattern=r"^(PERCENT|FIXED|PERCENT_PLUS_FIXED)$")
+    rate_bp: int = Field(default=0, ge=0, le=10_000)
+    fixed_cents: int = Field(default=0, ge=0, le=50_000_000)
+    min_cents: int | None = Field(default=None, ge=0, le=50_000_000)
+    max_cents: int | None = Field(default=None, ge=0, le=50_000_000)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    note: str | None = Field(default=None, max_length=200)
+
+
+class CloseRuleIn(_In):
+    valid_to: datetime | None = None
+
+
+class CommissionRuleOut(BaseModel):
+    id: int
+    scope: str
+    scope_ref: str | None
+    type: str
+    rate_bp: int
+    fixed_cents: int
+    min_cents: int | None
+    max_cents: int | None
+    valid_from: datetime
+    valid_to: datetime | None
+    note: str | None
+    created_at: datetime
+
+
+class QuotePreviewOut(BaseModel):
+    rule_id: int | None
+    rule_scope: str
+    price: Decimal
+    service_tax: Decimal
+    total_charged: Decimal
+    commission: Decimal
+    commission_tax: Decimal
+    withholding_isr: Decimal
+    withholding_iva: Decimal
+    technician_net: Decimal
+    application_fee: Decimal
+    provider_cost_estimate: Decimal
+
+
+class AdminAccountOut(BaseModel):
+    id: str
+    technician_id: str
+    provider: str
+    provider_account_id: str | None
+    status: str
+    can_receive_payments: bool
+    blocked_reason: str | None
+    requirements_due: list[str]
+    name_matches_kyc: bool | None
+    last_synced_at: datetime | None
+
+
+class WebhookEventOut(BaseModel):
+    id: int
+    provider_event_id: str
+    type: str
+    status: str
+    attempts: int
+    last_error: str | None
+    received_at: datetime
+    processed_at: datetime | None
+
+
+class AlertOut(BaseModel):
+    id: str
+    type: str
+    payload: dict
+    created_at: datetime
+    acknowledged_at: datetime | None
+
+
+class OrderPaymentLineOut(BaseModel):
+    kind: str
+    status: str
+    total: Decimal
+    captured: Decimal
+    refunded: Decimal
+    created_at: datetime

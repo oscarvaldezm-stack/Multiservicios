@@ -24,10 +24,16 @@ from app.core.errors import DomainError
 from app.kyc.permissions import Permission
 from app.models import OrderStatus, Payment, ServiceOrder, User, UserRole
 from app.orders import service
-from app.payments import idempotency
+from app.payments import idempotency, panel
 from app.payments import service as payments
 from app.payments.commission import from_cents
-from app.schemas.payments import DepartOut, OrderPaymentClientOut, OrderPaymentTechnicianOut, PaymentMethodIn
+from app.schemas.payments import (
+    DepartOut,
+    OrderPaymentClientOut,
+    OrderPaymentLineOut,
+    OrderPaymentTechnicianOut,
+    PaymentMethodIn,
+)
 from app.schemas.marketplace import (
     AcceptIn,
     DisputeIn,
@@ -231,11 +237,23 @@ def get_order_payment(user: CurrentUser, db: DbSession, order_id: uuid.UUID = Or
     return _client_view(payment, payments.client_secret_for_action(payment))
 
 
+@router.get("/{order_id}/payments", response_model=list[OrderPaymentLineOut],
+            summary="Todos los cobros de la orden (servicio, ajustes, cargos por cancelación)")
+def list_order_payments(user: CurrentUser, db: DbSession, order_id: uuid.UUID = OrderId):
+    order = service.get_for_user(db, user, order_id)                      # dueño o técnico asignado; si no, 404
+    rows = db.scalars(select(Payment).where(Payment.service_order_id == order.id).order_by(Payment.created_at))
+    return [OrderPaymentLineOut(kind=p.kind.value, status=p.status.value, total=from_cents(p.amount_cents),
+                                captured=from_cents(p.captured_cents), refunded=from_cents(p.refunded_cents),
+                                created_at=p.created_at) for p in rows]
+
+
 @router.post("/{order_id}/payment-method", response_model=OrderPaymentClientOut,
              summary="Elegir con qué tarjeta guardada se paga (cliente; requiere Idempotency-Key)")
 def choose_payment_method(data: PaymentMethodIn, client: CurrentClient, db: DbSession,
                           idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
                           order_id: uuid.UUID = OrderId):
+    panel.check_payment_method_rate(db, client.id)
+
     def operation() -> dict:
         order = service.get_for_user(db, client, order_id, lock=True)
         payment = payments.set_payment_method(db, client, order, data.payment_method_id)

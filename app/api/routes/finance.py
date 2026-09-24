@@ -23,7 +23,7 @@ from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.kyc.permissions import Permission
 from app.models import CancellationPolicy, Payment, PaymentDispute, PaymentRefund, RefundStatus, ServiceOrder, UserRole
-from app.payments import cancellations, disputes, idempotency, refunds, statements
+from app.payments import cancellations, disputes, idempotency, panel, refunds, statements
 from app.payments.commission import from_cents, to_cents
 from app.payments.providers import PaymentProvider, get_provider
 from app.schemas.payments import (
@@ -82,6 +82,8 @@ def _dispute_out(d: PaymentDispute) -> DisputeOut:
 def request_refund(data: RefundRequestIn, client: CurrentClient, db: DbSession,
                    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
                    order_id: uuid.UUID = Path(description="ID de la orden")):
+    panel.check_refund_request_rate(db, client.id)
+
     def operation() -> dict:
         refund = refunds.request_by_client(db, client, order_id, reason_code=data.reason_code,
                                            amount_cents=to_cents(data.amount) if data.amount is not None else None,

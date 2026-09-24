@@ -1,6 +1,6 @@
 # Multiservicios API: Backend
 
-Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa; Fase 4: webhooks, worker y conciliación; Fase 5: reembolsos, cancelaciones, contracargos y estado de cuenta del técnico).
+Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa; Fase 4: webhooks, worker y conciliación; Fase 5: reembolsos, cancelaciones, contracargos y estado de cuenta del técnico; Fase 6: panel de finanzas).
 
 FastAPI · SQLAlchemy 2.0 · PostgreSQL · OAuth2 Password Flow + JWT · Passlib/bcrypt
 
@@ -49,6 +49,8 @@ app/
 │   ├── cancellations.py # Políticas de cancelación: cargo tardío y cargo por visita
 │   ├── disputes.py      # Contracargos: evidencia y reversión al técnico solo si se pierde (D9)
 │   ├── statements.py    # Ganancias, depósitos y saldo del técnico
+│   ├── reports.py       # Reportes del libro contable y exportación CSV
+│   ├── panel.py         # Alertas de finanzas, bandeja de webhooks, límites por usuario
 │   └── providers/       # Contrato PaymentProvider, adaptador de Stripe y proveedor falso
 ├── reviews/             # Calificaciones: servicio, antifraude, reputación, firma de integridad, filtros de texto
 ├── audit/writer.py      # Auditoría con cadena de hashes y verify_chain()
@@ -67,7 +69,8 @@ app/
 │       ├── reviews.py         # /reviews, /technicians/{id}/reviews, /admin/reviews
 │       ├── payments.py        # /technicians/me/payment-account, /clients/me/payment-methods
 │       ├── webhooks.py        # /webhooks/stripe y /webhooks/stripe-connect (firma, sin JWT)
-│       └── finance.py         # Reembolsos, contracargos, políticas de cancelación, estado de cuenta
+│       ├── finance.py         # Reembolsos, contracargos, políticas de cancelación, estado de cuenta
+│       └── finance_panel.py   # Panel de finanzas: reportes, pagos, reglas, cuentas, webhooks, alertas
 └── main.py              # App, CORS, TrustedHost, headers de seguridad
 migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico, 0008 autorización y regla crítica ampliada, 0009 reembolsos, captura parcial y contracargos
 scripts/
@@ -78,7 +81,7 @@ scripts/
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
 worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas, captura de pagos, webhooks, conciliación
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
-tests/                   # 663 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+tests/                   # 682 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
@@ -1041,3 +1044,64 @@ Ahora se procesan `refund.*` (confirman o fallan reembolsos; uno hecho en el pan
 - **Comisión de disputa de Stripe:** no se asienta todavía (`PROVIDER_FEES`); hay que leerla de la transacción de saldo.
 - **Un reembolso ya exitoso que después falla** (el banco lo rechaza) se alerta a finanzas y no se revierte solo.
 - Pagos `ADJUSTMENT` (trabajo adicional aprobado por el cliente): el modelo los admite, falta su flujo en la app.
+
+---
+
+## 16. Pagos, Fase 6: panel de finanzas (API)
+
+Todo es API: la pantalla del panel (web) consume estos endpoints. Cada ruta exige permisos finos de finanzas; un intento sin permiso responde 403 y queda en la auditoría. Las acciones que cambian algo también se auditan.
+
+### 16.1 Reportes (`app/payments/reports.py`)
+
+Salen del **libro contable**, no de sumar columnas de pagos, así que cuadran con reembolsos y capturas parciales, contracargos y cargos por cancelación. Los días se cortan en la hora del centro de México (`REPORT_TIMEZONE`).
+
+| Ruta | Permiso | Qué devuelve |
+|---|---|---|
+| `GET /api/v1/admin/finance/summary?from=AAAA-MM-DD&to=AAAA-MM-DD&group_by=` | `FINANCE_READ` | Totales y grupos (`total`, `day`, `week`, `month`, `technician`, `category`), en centavos |
+| `GET /api/v1/admin/finance/ledger.csv?from=&to=` | `FINANCE_READ` | Asientos del periodo en CSV para contabilidad, solo con identificadores (sin datos personales); la exportación se audita |
+
+Métricas: `charged` (cobrado), `refunded`, `charged_back`, `commission` (neta de comisiones devueltas), `commission_vat`, `withheld` (ISR + IVA retenidos), `technicians` (lo que se les debe o pagó, neto de lo recuperado), `platform_absorbed` (reembolsos y contracargos que absorbió la plataforma), `platform_net` (comisión − absorbido, antes de la comisión de Stripe) y `captured_payments`. Por partida doble siempre se cumple `charged − refunded − charged_back = technicians + commission + commission_vat + withheld − platform_absorbed`, y una prueba lo verifica. El rango máximo es un año; un rango invertido o más largo responde 422.
+
+### 16.2 Pagos, reglas y cuentas
+
+| Ruta | Permiso | Notas |
+|---|---|---|
+| `GET /api/v1/admin/payments?status=&kind=&technician_id=&order_id=&from=&to=&limit=&offset=` | `FINANCE_READ` | Listado |
+| `GET /api/v1/admin/payments/{id}` | `FINANCE_READ` | Detalle: desgloses (cotización y captura), historial del proveedor, reembolsos, disputas y asientos |
+| `GET /api/v1/admin/commission-rules?active_only=` | `FINANCE_READ` | |
+| `POST /api/v1/admin/commission-rules` | `COMMISSION_RULES_MANAGE` (FINANCE_ADMIN) | Cierra la anterior del mismo alcance; 422 `COMMISSION_BELOW_PROVIDER_COST` con el precio donde daría pérdida |
+| `POST /api/v1/admin/commission-rules/{id}/close` | `COMMISSION_RULES_MANAGE` | La regla global no se cierra, se reemplaza |
+| `GET /api/v1/admin/commission-rules/preview?price=&category_id=&technician_id=` | `FINANCE_READ` | Cobro, comisión, impuestos, neto del técnico y costo estimado de Stripe con la regla vigente |
+| `GET /api/v1/admin/payment-accounts?status=&blocked=` | `FINANCE_READ` | Cuentas de técnicos, bloqueos y requisitos pendientes |
+| `GET /api/v1/orders/{id}/payments` | Cliente dueño o técnico asignado | Todos los cobros de la orden (servicio, cargos por cancelación) |
+
+### 16.3 Webhooks y alertas
+
+| Ruta | Permiso | Notas |
+|---|---|---|
+| `GET /api/v1/admin/payment-webhooks?status=` | `FINANCE_READ` | Bandeja de eventos del proveedor |
+| `POST /api/v1/admin/payment-webhooks/{id}/requeue` | `WEBHOOKS_MANAGE` (FINANCE_ADMIN) | Vuelve a la bandeja un evento `DEAD` o ignorado, tras corregir la causa |
+| `GET /api/v1/admin/finance/alerts?include_acknowledged=&type=` | `FINANCE_READ` | Conciliación, webhooks DEAD, autorizaciones por vencer o vencidas, contracargos, reembolsos (solicitados, fallidos, por aprobar, fuera de la app), reversiones fallidas, cargos no cobrados, cuentas con nombre distinto, riesgo |
+| `POST /api/v1/admin/finance/alerts/{id}/ack` | `FINANCE_ALERTS_ACK` (operador y admin) | Marca atendida, con nota; se audita |
+
+### 16.4 Límites por usuario
+
+Del doc de pagos, sobre lo que ya limita Nginx por IP: elegir tarjeta, `RATE_PAYMENT_METHOD_PER_MINUTE` (10 por minuto); pedir reembolso, `RATE_REFUND_REQUESTS_PER_HOUR` (5 por hora). Se cuentan en la base, así que valen aunque haya varias réplicas de la API; al pasarse, 429 `RATE_LIMITED`.
+
+### 16.5 Permisos de finanzas
+
+| Permiso | Lectura (VIEWER) | Operador | Admin |
+|---|---|---|---|
+| Ver reportes, pagos, reembolsos, disputas, cuentas, webhooks, alertas y exportar | Sí | Sí | Sí |
+| Reembolsos hasta el umbral, evidencia de disputas, atender alertas | No | Sí | Sí |
+| Segunda firma de reembolsos, reglas de comisión, políticas de cancelación, reencolar webhooks, revisar cuentas | No | No | Sí |
+
+### 16.6 Pruebas
+
+`tests/test_payments_panel.py`: el resumen cuadra con el libro y con la identidad de partida doble; cada agrupación suma el total y trae la etiqueta (nombre del técnico o de la categoría); periodo vacío; rangos inválidos; permisos; el CSV trae un renglón por asiento, suma cero, no lleva datos personales y queda auditado; listado y detalle de pagos; pagos de una orden solo para sus participantes; reglas por la API (permiso, pérdida, vista previa, cierre); cuentas bloqueadas; reencolar webhooks DEAD; alertas con permiso, acuse y auditoría; límites por usuario.
+
+### 16.7 Limitaciones
+
+- **La pantalla del panel** (frontend) no es parte de este repositorio; esta fase entrega la API que la alimenta.
+- `platform_net` es antes de la comisión de Stripe (aún no se asienta `PROVIDER_FEES`).
+- Los reportes leen de la base principal; si el volumen crece, conviene moverlos a una réplica de lectura o a tablas resumen.

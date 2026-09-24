@@ -136,6 +136,10 @@ class Settings(BaseSettings):
     # --- Pagos (Fase 5) -----------------------------------------------------------------------
     # D8: reembolsos arriba de este monto (lo que se devuelve al cliente) requieren una segunda firma.
     REFUND_DOUBLE_APPROVAL_CENTS: int = Field(default=200_000, ge=0)
+    # --- Pagos (Fase 6: panel de finanzas) ----------------------------------------------------
+    REPORT_TIMEZONE: str = Field(default="America/Mexico_City", min_length=3, max_length=60)
+    RATE_PAYMENT_METHOD_PER_MINUTE: int = Field(default=10, ge=1)    # elegir tarjeta, por usuario
+    RATE_REFUND_REQUESTS_PER_HOUR: int = Field(default=5, ge=1)      # solicitudes de reembolso, por cliente
     # Adónde vuelve el técnico al terminar (o al vencer) el formulario de Stripe. HTTPS en producción.
     STRIPE_CONNECT_RETURN_URL: str = "http://localhost:3000/pagos/cuenta/listo"
     STRIPE_CONNECT_REFRESH_URL: str = "http://localhost:3000/pagos/cuenta/reintentar"
@@ -177,6 +181,17 @@ class Settings(BaseSettings):
         if len(set(secrets_)) != len(secrets_):
             raise ValueError("JWT_SECRET_KEY, KYC_MASTER_KEY, KYC_BLIND_INDEX_KEY e INTEGRITY_KEY deben ser distintas")
         return self
+
+    @field_validator("REPORT_TIMEZONE")
+    @classmethod
+    def _check_timezone(cls, v: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"REPORT_TIMEZONE no es una zona horaria válida: {v}") from exc
+        return v
 
     @model_validator(mode="after")
     def _payment_range(self) -> "Settings":

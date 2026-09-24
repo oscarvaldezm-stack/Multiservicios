@@ -46,6 +46,9 @@ class Permission(str, enum.Enum):
     REFUNDS_APPROVE_HIGH = "finance:refunds:approve_high"          # segunda firma arriba del umbral
     DISPUTES_MANAGE = "finance:disputes:manage"                    # evidencia de contracargos
     CANCELLATION_POLICIES_MANAGE = "finance:cancellation_policies:manage"
+    # Pagos (Fase 6)
+    FINANCE_ALERTS_ACK = "finance:alerts:ack"                      # marcar alertas de finanzas como atendidas
+    WEBHOOKS_MANAGE = "finance:webhooks:manage"                    # reencolar eventos del proveedor
 
 
 P = Permission
@@ -69,11 +72,11 @@ ROLE_PERMISSIONS: dict[AdminRole, frozenset[Permission]] = {
     # Roles de finanzas: sin permisos KYC; resuelven disputas de dinero.
     AdminRole.FINANCE_VIEWER: frozenset({P.ORDERS_READ, P.FINANCE_READ}),
     AdminRole.FINANCE_OPERATOR: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE, P.FINANCE_READ, P.REFUNDS_EXECUTE,
-                                           P.DISPUTES_MANAGE}),
+                                           P.DISPUTES_MANAGE, P.FINANCE_ALERTS_ACK}),
     AdminRole.FINANCE_ADMIN: frozenset({P.ORDERS_READ, P.ORDERS_DISPUTE_RESOLVE, P.COMMISSION_RULES_MANAGE,
                                         P.PAYMENT_ACCOUNTS_REVIEW, P.FINANCE_READ, P.REFUNDS_EXECUTE,
                                         P.REFUNDS_APPROVE_HIGH, P.DISPUTES_MANAGE,
-                                        P.CANCELLATION_POLICIES_MANAGE}),
+                                        P.CANCELLATION_POLICIES_MANAGE, P.FINANCE_ALERTS_ACK, P.WEBHOOKS_MANAGE}),
     # Moderación de contenido: única que puede PUBLICAR (revertir un ocultamiento) y ELIMINAR reseñas (la bitácora de cada reseña va en su detalle).
     AdminRole.CONTENT_MODERATOR: frozenset({P.REVIEWS_READ, P.REVIEWS_MODERATE, P.REVIEWS_PUBLISH,
                                             P.REVIEWS_REMOVE}),
