@@ -1,0 +1,15 @@
+# Nada de secretos ni basura local en la imagen.
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+.venv
+.pytest_cache
+var/
+tests/
+*.zip
+docker-compose*.yml
+Dockerfile

@@ -5,21 +5,22 @@ Panel de finanzas (Fase 6): alertas, bandeja de webhooks y límites por usuario.
   reembolsos fallidos o pendientes de segunda firma, contracargos, cargos no cobrados, cuentas
   con nombre distinto...). Se listan y se marcan como atendidas (auditado).
 - Webhooks: consulta de la bandeja y reencolado de un evento DEAD o ignorado (tras corregir la causa).
-- Límites por usuario en los POST de dinero (el límite por IP lo pone Nginx).
+- Límites por usuario en las rutas que llaman al proveedor y en los POST de dinero (el límite por
+  IP lo pone Nginx); los intentos se cuentan aunque la petición falle.
 """
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.audit.writer import write_audit
 from app.core.actor import Actor, RequestContext
 from app.core.config import get_settings
 from app.core.errors import DomainError
-from app.models import IdempotencyKey, OutboxEvent, PaymentRefund, PaymentWebhookEvent, WebhookEventStatus
+from app.models import OutboxEvent, PaymentRefund, PaymentWebhookEvent, RateLimitHit, WebhookEventStatus
 
 W = WebhookEventStatus
 
@@ -30,6 +31,7 @@ ALERT_TYPES = (
     "payment.refunded_outside_app", "refund.failed", "refund.failed_after_success",
     "refund.second_approval_required", "refund.requested", "dispute.reversal_failed",
     "cancellation_fee.not_collected", "payment_account.name_mismatch", "risk.chargeback_lost",
+    "payment.capture_amount_mismatch",
 )
 
 
@@ -99,13 +101,37 @@ def _limited(message: str) -> DomainError:
     return DomainError(message, code="RATE_LIMITED", http_status=429)
 
 
+def hit(db: Session, user_id: uuid.UUID, action: str, *, limit: int, window: timedelta, message: str) -> None:
+    """
+    Cuenta un intento y lo rechaza con 429 si ya se pasó. Usa su propia sesión y confirma al
+    instante: el intento queda contado aunque la petición falle y haga rollback después.
+    """
+    since = _now() - window
+    with Session(bind=db.get_bind()) as own:
+        n = own.scalar(select(func.count()).select_from(RateLimitHit).where(
+            RateLimitHit.user_id == user_id, RateLimitHit.action == action, RateLimitHit.created_at >= since))
+        if n >= limit:
+            raise _limited(message)
+        own.add(RateLimitHit(user_id=user_id, action=action))
+        own.commit()
+
+
+def check_provider_rate(db: Session, user_id: uuid.UUID) -> None:
+    """Toda ruta de usuario que llama al proveedor: una sola cuota por usuario (protege la de Stripe)."""
+    hit(db, user_id, "provider", limit=get_settings().RATE_PROVIDER_CALLS_PER_MINUTE, window=timedelta(minutes=1),
+        message="Demasiadas solicitudes; espera un minuto")
+
+
 def check_payment_method_rate(db: Session, user_id: uuid.UUID) -> None:
-    since = _now() - timedelta(minutes=1)
-    n = db.scalar(select(func.count()).select_from(IdempotencyKey).where(
-        IdempotencyKey.user_id == user_id, IdempotencyKey.endpoint.like("orders/%/payment-method"),
-        IdempotencyKey.created_at >= since))
-    if n >= get_settings().RATE_PAYMENT_METHOD_PER_MINUTE:
-        raise _limited("Demasiados intentos; espera un minuto")
+    hit(db, user_id, "payment-method", limit=get_settings().RATE_PAYMENT_METHOD_PER_MINUTE,
+        window=timedelta(minutes=1), message="Demasiados intentos; espera un minuto")
+    check_provider_rate(db, user_id)
+
+
+def purge_rate_hits(db: Session, now: datetime | None = None) -> int:
+    """Trabajo: los intentos solo sirven para ventanas cortas; se borran al día."""
+    limit = (now or _now()) - timedelta(days=1)
+    return db.execute(delete(RateLimitHit).where(RateLimitHit.created_at < limit)).rowcount or 0
 
 
 def check_refund_request_rate(db: Session, user_id: uuid.UUID) -> None:

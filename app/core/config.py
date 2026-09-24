@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     ORDER_AUTO_APPROVE_HOURS: int = Field(default=72, ge=1)    # decisión de pagos D5
     ORDER_REQUEST_EXPIRY_HOURS: int = Field(default=72, ge=1)  # solicitud sin técnico se cancela
     ORDER_DISPUTE_WINDOW_DAYS: int = Field(default=7, ge=1)    # después del pago
+    # "En camino" solo desde estas horas antes de la cita: evita reservar la tarjeta días antes y
+    # cobrar el cargo por visita (ON_SITE) en lugar del de cancelación tardía (revisión Fase 7).
+    ORDER_DEPART_WINDOW_HOURS: int = Field(default=3, ge=1, le=24)
     ORDER_MAX_OPEN_PER_CLIENT: int = Field(default=5, ge=1)       # solicitudes abiertas a la vez (antispam)
 
     # --- Pagos (Fase 1: montos, impuestos y costo del proveedor) -------------------------
@@ -140,6 +143,7 @@ class Settings(BaseSettings):
     REPORT_TIMEZONE: str = Field(default="America/Mexico_City", min_length=3, max_length=60)
     RATE_PAYMENT_METHOD_PER_MINUTE: int = Field(default=10, ge=1)    # elegir tarjeta, por usuario
     RATE_REFUND_REQUESTS_PER_HOUR: int = Field(default=5, ge=1)      # solicitudes de reembolso, por cliente
+    RATE_PROVIDER_CALLS_PER_MINUTE: int = Field(default=30, ge=1)    # rutas de usuario que llaman a Stripe
     # Adónde vuelve el técnico al terminar (o al vencer) el formulario de Stripe. HTTPS en producción.
     STRIPE_CONNECT_RETURN_URL: str = "http://localhost:3000/pagos/cuenta/listo"
     STRIPE_CONNECT_REFRESH_URL: str = "http://localhost:3000/pagos/cuenta/reintentar"
@@ -211,7 +215,8 @@ class Settings(BaseSettings):
         hooks = [h.get_secret_value() for h in (self.STRIPE_WEBHOOK_SECRET, self.STRIPE_CONNECT_WEBHOOK_SECRET) if h]
         if any(not h.startswith("whsec_") for h in hooks):
             raise ValueError("Los secretos de webhook de Stripe empiezan con whsec_")
-        if len(hooks) == 2 and hooks[0] == hooks[1]:
+        # El CLI de Stripe (stripe listen) firma todo con un solo secreto: se tolera solo fuera de producción.
+        if len(hooks) == 2 and hooks[0] == hooks[1] and self.ENVIRONMENT == "production":
             raise ValueError("STRIPE_WEBHOOK_SECRET y STRIPE_CONNECT_WEBHOOK_SECRET deben ser distintos")
         if self.PAYMENT_PROVIDER_BACKEND == "stripe":
             if not sk or not pk:

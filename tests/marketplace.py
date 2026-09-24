@@ -131,7 +131,7 @@ def run_order(client, db, ch, th, category, *, until: str = "READY_FOR_REVIEW", 
     steps = [
         ("ACCEPTED", lambda: client.post(f"{ORDERS}/{oid}/accept", headers=th, json={"agreed_price": price})),
         ("SCHEDULED", lambda: client.post(f"{ORDERS}/{oid}/schedule", headers=th, json={
-            "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()})),
+            "scheduled_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()})),
         ("AUTHORIZED", lambda: _depart(client, db, ch, th, oid, fingerprint)),
         ("IN_PROGRESS", lambda: client.post(f"{ORDERS}/{oid}/start", headers=th)),
         ("AWAITING_APPROVAL", lambda: client.post(f"{ORDERS}/{oid}/finish", headers=th)),

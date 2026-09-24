@@ -78,6 +78,7 @@ from app.models.payments import (
     Payment,
     PaymentCustomer,
     PaymentDispute,
+    RateLimitHit,
     PaymentRefund,
     PaymentTransaction,
     PaymentWebhookEvent,
@@ -101,7 +102,7 @@ __all__ = [
     "CancellationPolicy", "CommissionRule", "CommissionScope", "CommissionTransaction", "CommissionType",
     "DisputeStatus", "IdempotencyKey", "LedgerAccount", "LedgerEntry", "PaymentAccountStatus", "PaymentCustomer",
     "PaymentDispute", "PaymentKind", "PaymentRefund", "PaymentTransaction", "PaymentTransactionType",
-    "PaymentWebhookEvent", "Payout", "PayoutStatus", "RefundStatus", "TechnicianPaymentAccount",
+    "PaymentWebhookEvent", "Payout", "PayoutStatus", "RateLimitHit", "RefundStatus", "TechnicianPaymentAccount",
     "WebhookEventStatus",
     "TechnicianService", "User", "UserRole",
 ]

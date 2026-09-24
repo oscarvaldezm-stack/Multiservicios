@@ -1,0 +1,139 @@
+# Entorno LOCAL completo con un solo comando:
+#
+#   python scripts/dev_env.py        # genera .env con secretos aleatorios (una sola vez)
+#   docker compose up -d --build     # API, workers, PostgreSQL, Nginx y ClamAV
+#   docker compose --profile stripe up -d stripe-cli   # opcional: reenvía webhooks de Stripe (modo prueba)
+#
+# API en http://localhost:8080 (docs en /docs). Guía completa: README, sección 17.
+#
+# Redes:
+#   backend  (interna, sin internet): PostgreSQL, API, workers, ClamAV. El worker de documentos
+#            vive SOLO aquí: procesa archivos no confiables y no debe poder sacar nada a internet.
+#   edge     : Nginx (el único puerto publicado, y solo en 127.0.0.1), la API y el worker de trabajos
+#              (hablan con Stripe), ClamAV (descarga firmas) y el CLI de Stripe.
+
+x-app: &app
+  build: .
+  image: multiservicios-api:local
+  env_file: .env
+  environment: &app-env
+    DATABASE_URL: postgresql+psycopg://multiservicios_app:${POSTGRES_APP_PASSWORD:?Ejecuta scripts/dev_env.py}@db:5432/multiservicios
+    STORAGE_BACKEND: local
+    STORAGE_LOCAL_ROOT: /app/var/storage
+    KYC_SCANNER: clamd
+    CLAMD_HOST: clamav
+    CLAMD_PORT: "3310"
+    ALLOWED_HOSTS: '["localhost","127.0.0.1","nginx"]'
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  volumes:
+    - kyc_storage:/app/var/storage
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Ejecuta scripts/dev_env.py}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Ejecuta scripts/dev_env.py}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./deploy/postgres/init-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d multiservicios"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Una sola vez por arranque: migraciones (con todos los triggers) y categorías de ejemplo.
+  migrate:
+    <<: *app
+    command: ["python", "-m", "scripts.init_db"]
+    restart: "no"
+    networks: [backend]
+    depends_on:
+      db: { condition: service_healthy }
+
+  api:
+    <<: *app
+    networks: [backend, edge]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  # Webhooks, capturas, plazos de autorización, reembolsos, conciliación, órdenes y KYC.
+  jobs:
+    <<: *app
+    command: ["python", "-m", "worker.jobs", "--loop", "--every", "60"]
+    networks: [backend, edge]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  # Documentos KYC: sin internet, con límites de CPU y memoria (decodifica archivos no confiables).
+  docs-worker:
+    <<: *app
+    command: ["python", "-m", "worker.run"]
+    networks: [backend]
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      clamav: { condition: service_started }
+
+  clamav:
+    image: clamav/clamav:stable
+    networks: [backend, edge]
+    volumes:
+      - clamav_db:/var/lib/clamav
+    restart: unless-stopped
+
+  nginx:
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    volumes:
+      - ./deploy/nginx/nginx.docker.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks: [edge]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Opcional (perfil "stripe"): reenvía los eventos de tu cuenta de Stripe en MODO PRUEBA a los
+  # dos endpoints. Imprime un whsec_ que va en STRIPE_WEBHOOK_SECRET y STRIPE_CONNECT_WEBHOOK_SECRET.
+  stripe-cli:
+    image: stripe/stripe-cli:latest
+    profiles: [stripe]
+    command:
+      - listen
+      - --api-key
+      - ${STRIPE_CLI_API_KEY:-${STRIPE_SECRET_KEY:-sin_clave}}
+      - --forward-to
+      - http://nginx:8080/api/v1/webhooks/stripe
+      - --forward-connect-to
+      - http://nginx:8080/api/v1/webhooks/stripe-connect
+    networks: [edge]
+    depends_on: [nginx]
+
+networks:
+  backend:
+    internal: true
+  edge: {}
+
+volumes:
+  pg_data: {}
+  kyc_storage: {}
+  clamav_db: {}

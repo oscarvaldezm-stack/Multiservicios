@@ -36,7 +36,6 @@ def test_modo_prueba_valido():
     ({"STRIPE_SECRET_KEY": None}, "se requieren"),
     ({"STRIPE_PUBLISHABLE_KEY": PK_LIVE}, "mismo modo"),
     ({"STRIPE_SECRET_KEY": RK_LIVE, "STRIPE_PUBLISHABLE_KEY": PK_LIVE}, "Fuera de producción"),
-    ({"STRIPE_WEBHOOK_SECRET": WH1, "STRIPE_CONNECT_WEBHOOK_SECRET": WH1}, "distintos"),
     ({"STRIPE_WEBHOOK_SECRET": "abc"}, "whsec_"),
 ])
 def test_configuracion_insegura_se_rechaza(over, msg):
@@ -59,10 +58,16 @@ def _prod(**over) -> Settings:
     ({"STRIPE_SECRET_KEY": SK_TEST, "STRIPE_PUBLISHABLE_KEY": PK_TEST}, "modo live"),
     ({"STRIPE_CONNECT_WEBHOOK_SECRET": None}, "STRIPE_CONNECT_WEBHOOK_SECRET"),
     ({"STRIPE_CONNECT_RETURN_URL": "http://app.example.mx/listo"}, "HTTPS"),
+    ({"STRIPE_CONNECT_WEBHOOK_SECRET": WH1}, "distintos"),
 ])
 def test_produccion_exige_stripe_live_y_webhooks(over, msg):
     with pytest.raises(ValueError, match=msg):
         _prod(**over)
+
+
+def test_fuera_de_produccion_se_tolera_un_solo_secreto_del_cli_de_stripe():
+    """stripe listen firma los eventos de plataforma y de Connect con el mismo whsec_."""
+    assert settings(STRIPE_WEBHOOK_SECRET=WH1, STRIPE_CONNECT_WEBHOOK_SECRET=WH1).STRIPE_WEBHOOK_SECRET
 
 
 def test_produccion_con_stripe_live_arranca():

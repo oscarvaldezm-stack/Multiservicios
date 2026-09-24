@@ -39,7 +39,7 @@ def test_transiciones_de_la_app_y_del_trigger_coinciden():
     mig = importlib.import_module("migrations.versions.0005_ordenes_resenas_y_decisiones_kyc")
     app_pairs = {f"{a.value}>{b.value}" for a, b in ALLOWED_TRANSITIONS}
     assert app_pairs == set(mig.ORDER_TRANSITIONS)
-    pagos = importlib.import_module("migrations.versions.0006_pagos_fase1_modelo_comisiones_y_ledger")
+    pagos = importlib.import_module("migrations.versions.0010_pagos_fase7_reembolso_durante_disputa")
     assert {f"{a.value}>{b.value}" for a, b in ALLOWED_PAYMENT_TRANSITIONS} == set(pagos.PAYMENT_TRANSITIONS)
 
 

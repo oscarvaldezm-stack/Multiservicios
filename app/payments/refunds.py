@@ -113,6 +113,19 @@ def _permissions(actor: Actor):
     return permissions_for(actor.admin_roles) if actor.actor_type == ActorType.ADMIN else frozenset()
 
 
+def needs_high_approval(payment: Payment, amount_cents: int) -> bool:
+    """D8 sobre el ACUMULADO del pago: partir un reembolso grande en varios chicos no evita la 2a firma."""
+    return payment.refunded_cents + amount_cents > get_settings().REFUND_DOUBLE_APPROVAL_CENTS
+
+
+def require_high_approval(actor: Actor, reduction_cents: int) -> None:
+    """Para lo que reduce un cobro sin pasar por un reembolso (resolver una disputa antes de capturar)."""
+    from app.kyc.permissions import Permission
+
+    if reduction_cents > get_settings().REFUND_DOUBLE_APPROVAL_CENTS:
+        _require(actor, Permission.REFUNDS_APPROVE_HIGH)
+
+
 def _require(actor: Actor, perm) -> None:
     if perm not in _permissions(actor):
         raise RefundError("No tienes permiso para esta acción", code="FORBIDDEN", http_status=403)
@@ -230,7 +243,7 @@ def create_by_finance(db: Session, actor: Actor, payment_id: uuid.UUID, *, amoun
                 reason_code=reason_code, reason_note=note,
                 changes={"payment_id": str(payment.id), "amount_cents": refund.amount_cents, "source": source},
                 ctx=ctx)
-    if refund.amount_cents <= get_settings().REFUND_DOUBLE_APPROVAL_CENTS:
+    if not needs_high_approval(payment, refund.amount_cents):
         _move(refund, R.APPROVED)
         execute(db, refund, provider)
     else:
@@ -250,9 +263,12 @@ def approve(db: Session, actor: Actor, refund_id: uuid.UUID, *, provider: Paymen
         raise RefundError("El reembolso no está pendiente de aprobación", code="REFUND_NOT_PENDING")
     if refund.requested_by == actor.user_id:
         raise RefundError("Quien pide un reembolso no puede aprobarlo", code="REFUND_FOUR_EYES", http_status=403)
-    if refund.amount_cents > get_settings().REFUND_DOUBLE_APPROVAL_CENTS:
+    payment = _lock_payment(db, refund.payment_id)
+    if needs_high_approval(payment, refund.amount_cents):
         _require(actor, Permission.REFUNDS_APPROVE_HIGH)
-    _lock_payment(db, refund.payment_id)
+    if payment.status not in REFUNDABLE:
+        raise RefundError("El pago ya no admite reembolsos (contracargo abierto o cerrado)",
+                          code="REFUND_PAYMENT_NOT_REFUNDABLE")
     refund.approved_by = actor.user_id
     _move(refund, R.APPROVED)
     write_audit(db, action="refund.approved", actor=actor, target_type="payment_refund", target_id=str(refund.id),
@@ -295,6 +311,11 @@ def execute(db: Session, refund: PaymentRefund, provider: PaymentProvider | None
     if refund.status != R.APPROVED:
         return refund
     payment = _lock_payment(db, refund.payment_id)
+    if payment.status not in REFUNDABLE:
+        # Se abrió un contracargo (o se cerró) entre la aprobación y el envío: el banco ya decide
+        # sobre ese dinero y reembolsar además lo devolvería dos veces.
+        _fail(db, refund, "PAYMENT_NOT_REFUNDABLE")
+        return refund
     provider = provider or payments._provider(None)
     refund.executed_at = _now()
     try:
@@ -369,7 +390,11 @@ def _succeed(db: Session, refund: PaymentRefund) -> None:
     _move(refund, R.SUCCEEDED)
     total = payment.refunded_cents + refund.amount_cents
     full = total >= payment.captured_cents
-    move(payment, P.REFUNDED if full else P.PARTIALLY_REFUNDED)
+    # Un reembolso que ya estaba en curso puede confirmarse con un contracargo abierto: el pago SE
+    # QUEDA en DISPUTED (si saliera, un contracargo perdido ya no se procesaría) y el cierre de la
+    # disputa descuenta lo reembolsado (disputes.charge_back) o lo lleva a su estado final.
+    if payment.status != P.DISPUTED:
+        move(payment, P.REFUNDED if full else P.PARTIALLY_REFUNDED)
     payment.refunded_cents = min(total, payment.captured_cents)
     payment.refunded_at = _now()
     db.flush()

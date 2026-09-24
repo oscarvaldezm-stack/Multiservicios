@@ -96,6 +96,12 @@ def reconcile(db: Session, provider: PaymentProvider | None = None, *, now: date
                                                payment_id=str(payment.id), ours=payment.amount_cents,
                                                provider=pp.amount_cents)
                     continue
+                if payment.captured_cents and pp.amount_received_cents \
+                        and pp.amount_received_cents != payment.captured_cents:
+                    # Lo asentado no es lo que de verdad se cobró (captura parcial perdida, captura manual).
+                    counts["alerts"] += _alert(db, "CAPTURE_MISMATCH", str(payment.id), now,
+                                               payment_id=str(payment.id), ours=payment.captured_cents,
+                                               provider=pp.amount_received_cents)
                 if not consistent(payment.status, pp.status):
                     counts["fixed"] += payments.apply_provider_state(db, payment, pp)
                     if not consistent(payment.status, pp.status):

@@ -28,6 +28,7 @@ from app.core.errors import DomainError
 from app.orders.state_machine import PRE_START, OrderError, lock_order, transition
 from app.payments import service as payments
 from app.payments import refunds
+from app.payments.state_machine import CANCELLABLE
 from app.payments.commission import from_cents, price_for_charge, to_cents
 from app.models import (
     PAYMENT_CONFIRMED,
@@ -231,6 +232,10 @@ def depart(db: Session, technician: User, order_id: uuid.UUID, ctx: RequestConte
     if order.status != O.SCHEDULED:
         raise OrderError("Solo se sale a un servicio agendado", code="ORDER_NOT_SCHEDULED",
                          extra={"status": order.status.value})
+    earliest = order.scheduled_at - timedelta(hours=get_settings().ORDER_DEPART_WINDOW_HOURS)
+    if order.departed_at is None and _now() < earliest:
+        raise OrderError("Todavía es muy pronto para salir a este servicio", code="ORDER_DEPART_TOO_EARLY",
+                         extra={"earliest": earliest.isoformat()})
     payment = payments.authorize_for_departure(db, order)
     if payment.status == PaymentStatus.AUTHORIZED and order.departed_at is None:
         order.departed_at = _now()
@@ -354,6 +359,8 @@ def resolve_dispute(db: Session, admin: Actor, order_id: uuid.UUID, outcome: str
                                       note=note, source="DISPUTE", ctx=ctx)
         elif payment.status == PaymentStatus.AUTHORIZED and 0 < refund_cents < payment.amount_cents:
             # Aún sin cobrar: se captura solo lo que sí corresponde (servicio parcial); el resto se libera.
+            # Quitarle al cobro más del umbral D8 es como un reembolso grande: solo con REFUNDS_APPROVE_HIGH.
+            refunds.require_high_approval(admin, refund_cents)
             quote = payment.breakdown
             price = price_for_charge(payment.amount_cents - refund_cents, quote.service_tax_bp)
             payments.capture_partial(db, payment, price)
@@ -367,6 +374,8 @@ def resolve_dispute(db: Session, admin: Actor, order_id: uuid.UUID, outcome: str
             refunds.create_by_finance(db, admin, payment.id, amount_cents=None, reason_code="SERVICE_NOT_PROVIDED",
                                       note=note, source="DISPUTE", ctx=ctx)
         else:
+            if payment is not None and payment.status in CANCELLABLE:
+                refunds.require_high_approval(admin, payment.amount_cents)
             payments.cancel_for_order(db, order)
             transition(db, order, O.CANCELLED, admin, reason_code="DISPUTE_FULL_REFUND", note=note, ctx=ctx)
     else:

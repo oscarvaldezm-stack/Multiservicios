@@ -224,7 +224,13 @@ class StripePaymentProvider(PaymentProvider):
         error = _get(pi, "last_payment_error")
         status = force_status or cls._STATUS.get(_get(pi, "status"), PaymentStatus.PENDING)
         if status == PaymentStatus.PENDING and error is not None:
-            status = PaymentStatus.FAILED            # el intento se rechazó y no hay otro método
+            # Fuera de sesión el banco pidió 3D Secure: el cliente todavía puede autenticarse con el
+            # client_secret; no es un rechazo (si se marcara FAILED, una autenticación tardía dejaría
+            # dinero retenido en un pago muerto).
+            if _get(error, "code") == "authentication_required":
+                status = PaymentStatus.REQUIRES_ACTION
+            else:
+                status = PaymentStatus.FAILED        # el intento se rechazó y no hay otro método
         charge = _get(pi, "latest_charge")
         fingerprint = _get(charge, "payment_method_details", "card", "fingerprint") if not isinstance(charge, str) \
             else None

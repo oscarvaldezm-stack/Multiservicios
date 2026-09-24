@@ -15,11 +15,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, Path, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from sqlalchemy.orm import object_session
 
 from app.api.deps import CurrentClient, CurrentTechnician, CurrentUser, DbSession, ReqCtx, require_permission, \
     require_roles
 from app.core.actor import Actor
-from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.kyc.permissions import Permission
 from app.models import CancellationPolicy, Payment, PaymentDispute, PaymentRefund, RefundStatus, ServiceOrder, UserRole
@@ -64,7 +64,7 @@ def _finance_out(r: PaymentRefund) -> RefundFinanceOut:
         withholding_returned=from_cents(r.withholding_returned_cents),
         platform_absorbed=from_cents(r.platform_absorbed_cents),
         needs_second_approval=r.status == RefundStatus.REQUESTED
-        and r.amount_cents > get_settings().REFUND_DOUBLE_APPROVAL_CENTS,
+        and refunds.needs_high_approval(object_session(r).get(Payment, r.payment_id), r.amount_cents),
         failure_code=r.failure_code)
 
 
@@ -222,6 +222,7 @@ def my_payouts(tech: CurrentTechnician, db: DbSession, limit: int = Query(100, g
 
 @tech_router.get("/balance", response_model=BalanceOut, summary="Mi saldo en el proveedor (disponible y pendiente)")
 def my_balance(tech: CurrentTechnician, db: DbSession, provider: Provider):
+    panel.check_provider_rate(db, tech.id)
     info = statements.balance(db, tech.id, provider)
     if info is None:
         raise DomainError("Primero crea tu cuenta de pagos", code="PAYMENT_ACCOUNT_NOT_FOUND", http_status=404)

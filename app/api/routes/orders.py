@@ -143,6 +143,7 @@ def withdraw_order(data: ReasonIn, tech: CurrentTechnician, db: DbSession, ctx: 
 @router.post("/{order_id}/depart", response_model=DepartOut,
              summary="En camino (técnico): autoriza el cobro en la tarjeta del cliente; si falla, no salgas")
 def depart(tech: VerifiedTechnician, db: DbSession, ctx: ReqCtx, order_id: uuid.UUID = OrderId):
+    panel.check_provider_rate(db, tech.id)
     try:
         order, payment = service.depart(db, tech, order_id, ctx)
     except DomainError as exc:
@@ -268,6 +269,7 @@ def choose_payment_method(data: PaymentMethodIn, client: CurrentClient, db: DbSe
 @router.post("/{order_id}/payment/refresh", response_model=OrderPaymentClientOut,
              summary="Volver a consultar el cobro en el proveedor (cliente; nunca recibe un estado)")
 def refresh_order_payment(client: CurrentClient, db: DbSession, order_id: uuid.UUID = OrderId):
+    panel.check_provider_rate(db, client.id)
     payment = _payment_or_404(db, client, order_id, lock=True)
     payments.refresh_from_provider(db, payment)
     db.commit()

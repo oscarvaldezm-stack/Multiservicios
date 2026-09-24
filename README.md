@@ -1,6 +1,6 @@
 # Multiservicios API: Backend
 
-Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa; Fase 4: webhooks, worker y conciliación; Fase 5: reembolsos, cancelaciones, contracargos y estado de cuenta del técnico; Fase 6: panel de finanzas).
+Autenticación + KYC de técnicos (Fase 1: modelo de datos y núcleo; Fase 2: API del técnico, catálogos y permisos de administradores; Fase 3: documentos y sistema de protección de datos; Fase 4: decisiones del revisor, órdenes de servicio y calificaciones verificadas) + módulo de pagos (Fase 1: pagos en centavos, motor de comisiones y libro contable; Fase 2: Stripe en modo prueba, cuenta del técnico y guardado de tarjeta; Fase 3: autorización al salir el técnico, captura y regla crítica completa; Fase 4: webhooks, worker y conciliación; Fase 5: reembolsos, cancelaciones, contracargos y estado de cuenta del técnico; Fase 6: panel de finanzas; Fase 7: revisión de seguridad, Docker y guía de prueba con Stripe).
 
 FastAPI · SQLAlchemy 2.0 · PostgreSQL · OAuth2 Password Flow + JWT · Passlib/bcrypt
 
@@ -72,19 +72,28 @@ app/
 │       ├── finance.py         # Reembolsos, contracargos, políticas de cancelación, estado de cuenta
 │       └── finance_panel.py   # Panel de finanzas: reportes, pagos, reglas, cuentas, webhooks, alertas
 └── main.py              # App, CORS, TrustedHost, headers de seguridad
-migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico, 0008 autorización y regla crítica ampliada, 0009 reembolsos, captura parcial y contracargos
+migrations/              # Alembic: 0001 base, 0002 KYC, 0003 motivo de corrección, 0004 protección de datos y documentos, 0005 órdenes, pagos y calificaciones, 0006 pagos en centavos, comisiones y libro contable, 0007 cuenta de pagos del técnico, 0008 autorización y regla crítica ampliada, 0009 reembolsos, captura parcial y contracargos, 0010 reembolso durante un contracargo y límites por usuario
 scripts/
 ├── init_db.py           # Solo desarrollo: aplica migraciones y carga categorías
 ├── create_admin.py      # Único camino para crear administradores
 ├── load_sepomex.py      # Carga el catálogo oficial de códigos postales
-└── rotate_keys.py       # Estado, activación, re-envoltura, revocación y re-key de llaves
+├── rotate_keys.py       # Estado, activación, re-envoltura, revocación y re-key de llaves
+└── dev_env.py           # Solo desarrollo: .env con secretos aleatorios (Docker)
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
 worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas, captura de pagos, webhooks, conciliación
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
-tests/                   # 682 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+deploy/nginx/nginx.docker.conf # Nginx del entorno local de docker compose (127.0.0.1:8080)
+deploy/postgres/         # Usuario de la app con privilegios mínimos al crear la base en Docker
+Dockerfile, docker-compose.yml # Todo el entorno con un comando (sección 17.2)
+tools/stripe-test/       # Página local para guardar tarjetas y completar 3D Secure en modo prueba
+tests/                   # 702 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
+
+**Con Docker (recomendado):** `python scripts/dev_env.py && docker compose up -d --build`. Ver la sección 17.2.
+
+**Sin Docker:**
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -946,7 +955,7 @@ Si Stripe no respondió al anular una reserva (Fase 3), el trabajo la reintenta 
 ### 14.5 Configurar los webhooks en Stripe (modo prueba)
 
 1. En Stripe, en modo prueba: **Developers → Webhooks → Add endpoint**, con la URL `https://<tu-dominio>/api/v1/webhooks/stripe` y los eventos de la plataforma de la tabla 14.1. Copia su *Signing secret* a `STRIPE_WEBHOOK_SECRET`.
-2. Agrega otro endpoint marcando **"Listen to events on Connected accounts"**, con la URL `.../webhooks/stripe-connect` y los eventos de Connect. Su secreto va en `STRIPE_CONNECT_WEBHOOK_SECRET` y debe ser distinto.
+2. Agrega otro endpoint marcando **"Listen to events on Connected accounts"**, con la URL `.../webhooks/stripe-connect` y los eventos de Connect. Su secreto va en `STRIPE_CONNECT_WEBHOOK_SECRET` y en producción debe ser distinto (el CLI usa uno solo; ver 17.3).
 3. En desarrollo local, con Stripe CLI: `stripe listen --forward-to localhost:8000/api/v1/webhooks/stripe` (y `--forward-connect-to` para Connect); el CLI imprime el `whsec_` que va en `.env`.
 
 ### 14.6 Pruebas
@@ -1105,3 +1114,207 @@ Del doc de pagos, sobre lo que ya limita Nginx por IP: elegir tarjeta, `RATE_PAY
 - **La pantalla del panel** (frontend) no es parte de este repositorio; esta fase entrega la API que la alimenta.
 - `platform_net` es antes de la comisión de Stripe (aún no se asienta `PROVIDER_FEES`).
 - Los reportes leen de la base principal; si el volumen crece, conviene moverlos a una réplica de lectura o a tablas resumen.
+
+---
+
+## 17. Pagos, Fase 7: revisión de seguridad, Docker, prueba con Stripe y flujo completo
+
+### 17.1 Revisión de seguridad independiente
+
+Un revisor aparte (sin haber escrito el código) revisó todo el módulo de pagos buscando robo o pérdida de dinero, accesos cruzados, carreras, webhooks falsos, fugas y configuración. **Sin hallazgos críticos.** Encontró 7 problemas reales; los confirmó leyendo el código y dos con una prueba de concepto contra PostgreSQL. Todos quedaron corregidos, cada uno con su prueba de regresión en `tests/test_payments_security.py`.
+
+| # | Severidad | Hallazgo | Corrección |
+|---|---|---|---|
+| 1 | Alta | Un reembolso que ya estaba en curso y se confirmaba **durante un contracargo** sacaba al pago de `DISPUTED`. Al perder el contracargo ya no se procesaba: sin reversión al técnico (D9) ni asiento, y la plataforma absorbía todo. | El pago **se queda en `DISPUTED`** hasta que cierra la disputa. `charge_back` descuenta lo ya reembolsado. Si la disputa se gana con todo reembolsado, pasa a `REFUNDED` (nueva transición, migración **0010**). `approve` y `execute` rechazan reembolsos sobre un pago que ya no es reembolsable. |
+| 2 | Media | Un operador podía evitar la **segunda firma (D8)** partiendo un reembolso grande en varios chicos, o resolviendo una disputa antes de capturar (captura parcial mínima o anulación total). | D8 se mide sobre el **acumulado** del pago (`refunded + nuevo`). Resolver una disputa que quita más del umbral a un cobro autorizado exige `REFUNDS_APPROVE_HIGH`. |
+| 3 | Media | El técnico podía marcar "en camino" días antes: reservaba la tarjeta muy temprano y, si el cliente cancelaba, cobraba el **cargo por visita** en lugar del de cancelación tardía. | "En camino" solo desde `ORDER_DEPART_WINDOW_HOURS` (3 h) antes de la cita; antes responde 409 `ORDER_DEPART_TOO_EARLY`. |
+| 4 | Media | Si una captura parcial perdía su respuesta (timeout y rollback), el webhook asentaba el **total** en vez de lo que Stripe capturó de verdad. La conciliación no comparaba lo capturado. | Se asienta el monto real: el desglose se recalcula sobre lo capturado. Si ningún precio cuadra, alerta `payment.capture_amount_mismatch`. La conciliación alerta `CAPTURE_MISMATCH`. |
+| 5 | Media | Las rutas que llaman a Stripe no tenían límite por usuario, y el de elegir tarjeta **no contaba los intentos fallidos**. Unas pocas cuentas podían agotar la cuota de Stripe de toda la plataforma. | Tabla `rate_limit_hits`, escrita en **su propia transacción** (cuenta aunque la petición falle). `RATE_PROVIDER_CALLS_PER_MINUTE` (30) aplica a tarjetas, cuenta del técnico, saldo, refrescar y "en camino". El trabajo `payments.purge_rate_hits` limpia. |
+| 6 | Baja | Si al volver a consultar un cobro llegaba antes de que el cliente completara la **3D Secure**, el pago quedaba `FAILED`. Una autenticación tardía dejaba dinero retenido. | `authentication_required` se traduce a `REQUIRES_ACTION`. Una autorización que llega sobre un pago ya muerto se **anula sola** (cola de anulaciones con reintentos). Si ya se capturó, se alerta. |
+| 7 | Baja | Aprobar la revisión de nombre quitaba también un bloqueo del KYC que había quedado "detrás". | Al aprobar, si el KYC está suspendido o vencido, la cuenta queda con ese bloqueo. |
+
+**Lo que se revisó y está bien:**
+- **Acceso:** no hay IDOR en órdenes, pagos, tarjetas, reembolsos, ganancias ni saldo, y finanzas usa permisos finos.
+- **Cuatro ojos:** se cumple en la app y en la base.
+- **Montos y cuentas:** ningún monto, estado ni cuenta llega desde el cliente.
+- **Carreras:** hay bloqueos de fila, claves de idempotencia deterministas, deduplicación de webhooks y `SKIP LOCKED`.
+- **Webhooks:** firma por endpoint con tolerancia de 5 min, y el worker re-consulta cada objeto.
+- **Libro contable:** partida doble verificada por un trigger.
+- **Fugas:** `client_secret` solo va al dueño y los errores de Stripe se sanean.
+- **Claves:** no se aceptan claves live fuera de producción.
+
+**Ajuste para el CLI de Stripe:** `stripe listen` firma los eventos de plataforma y de Connect con **un solo** `whsec_`. Fuera de producción ya se acepta que `STRIPE_WEBHOOK_SECRET` y `STRIPE_CONNECT_WEBHOOK_SECRET` sean iguales. En producción siguen debiendo ser distintos.
+
+### 17.2 Docker: todo con un solo comando
+
+```bash
+python scripts/dev_env.py         # crea .env con secretos aleatorios distintos (no pisa uno existente; permisos 600)
+docker compose up -d --build      # PostgreSQL, migraciones, API, 2 workers, ClamAV y Nginx
+curl http://localhost:8080/health # {"status":"ok"}; documentación en http://localhost:8080/docs
+docker compose exec api python -m scripts.create_admin admin@tuempresa.com "Tu Nombre"
+```
+
+| Servicio | Qué hace | Red |
+|---|---|---|
+| `db` | PostgreSQL 16. Al crear el volumen, `deploy/postgres/init-app-role.sh` crea el usuario `multiservicios_app`, que no es superusuario y es dueño de su base. | backend |
+| `migrate` | `scripts.init_db`: migraciones con todos los triggers y categorías de ejemplo. Termina y los demás arrancan después. | backend |
+| `api` | uvicorn detrás de Nginx; healthcheck en `/health`. | backend + edge |
+| `jobs` | `worker.jobs --loop --every 60`: webhooks, capturas, plazos, reembolsos, conciliación, órdenes y KYC. | backend + edge |
+| `docs-worker` | `worker.run`: antivirus y saneamiento de documentos KYC. **Sin internet**, con 768 MB, 1 CPU y 128 procesos como máximo. | backend |
+| `clamav` | clamd, que descarga sus firmas. | backend + edge |
+| `nginx` | `deploy/nginx/nginx.docker.conf`: mismos límites por IP y logs sin tickets que producción, sin TLS. Único puerto publicado: **`127.0.0.1:8080`**. | edge |
+| `stripe-cli` | Opcional (`--profile stripe`): reenvía los webhooks de tu cuenta de prueba (17.3). | edge |
+
+**Endurecimiento:**
+- Una sola imagen (`Dockerfile`) con usuario sin privilegios (uid 10001). El código es de root y de solo lectura.
+- `read_only`, `cap_drop: ALL` y `no-new-privileges` en la API y los workers.
+- La red `backend` es `internal` (sin salida a internet).
+- `.dockerignore` deja fuera `.env`, `.git` y las pruebas. Los secretos solo entran como variables de entorno.
+
+**Validado en este entorno:**
+- Se construyó la imagen y se levantaron los 7 servicios (todos sanos).
+- A través de Nginx:
+  - `/health` responde 200.
+  - Un webhook firmado responde 200 y queda en la bandeja.
+  - Uno con firma inválida responde 400.
+  - Cualquier otra ruta responde 404.
+- Desde el `docs-worker`, clamd detecta la firma de prueba EICAR y no hay salida a internet.
+
+**Comandos útiles:**
+- `docker compose logs -f jobs`: ver los logs.
+- `docker compose down`: detener.
+- `docker compose down -v`: detener y **borrar los datos**.
+
+> **Producción no es este compose tal cual.** Usa `deploy/nginx/nginx.conf` (TLS y HSTS), `ENVIRONMENT=production`, S3 con KMS, llaves en un gestor de secretos, PostgreSQL administrado con respaldos y réplicas de la API. La aplicación se niega a arrancar en producción con configuración de desarrollo.
+
+### 17.3 Guía: probar contra Stripe en modo prueba, paso a paso
+
+Todo es en **modo prueba**: no se mueve dinero real. La app rechaza claves live fuera de producción.
+
+**1. Cuenta y claves**
+1. Crea una cuenta en Stripe, activa **Connect** y deja el panel en **modo prueba**.
+2. En *Developers → API keys* copia `pk_test_…` y `sk_test_…`. Mejor aún, crea una clave restringida `rk_test_` con permisos de escritura sobre PaymentIntents, SetupIntents, Customers, PaymentMethods, Refunds, Disputes, Transfers/Reversals y Accounts/Account Links, y de lectura sobre Balance, Payouts y Events.
+3. En `.env`:
+   ```
+   PAYMENT_PROVIDER_BACKEND=stripe
+   STRIPE_SECRET_KEY=rk_test_…      # o sk_test_…
+   STRIPE_PUBLISHABLE_KEY=pk_test_…
+   ```
+
+**2. Webhooks con el CLI de Stripe**
+```bash
+# Opción A: el CLI instalado en tu máquina (API sin Docker, en el puerto 8000)
+stripe login
+stripe listen --forward-to localhost:8000/api/v1/webhooks/stripe \
+              --forward-connect-to localhost:8000/api/v1/webhooks/stripe-connect
+# Opción B: dentro de docker compose
+docker compose --profile stripe up -d stripe-cli && docker compose logs stripe-cli
+```
+El CLI imprime `Ready! Your webhook signing secret is whsec_…`. Pon **ese mismo valor** en `STRIPE_WEBHOOK_SECRET` y en `STRIPE_CONNECT_WEBHOOK_SECRET`, y reinicia con `docker compose up -d api jobs`. Si el CLI no acepta tu clave restringida, define `STRIPE_CLI_API_KEY=sk_test_…`, solo en tu `.env` local.
+
+**3. Página de prueba de tarjetas** (en lugar del frontend)
+```bash
+python -m http.server 3000 --directory tools/stripe-test    # http://localhost:3000
+```
+Pega tu `pk_test_` y el `client_secret` que te dé la API. Nunca pegues una clave secreta; la página la rechaza.
+
+**4. Técnico: cuenta para cobrar**
+1. Registra un técnico y lleva su KYC hasta `APPROVED` (sección 10).
+2. `POST /api/v1/technicians/me/payment-account` crea la cuenta Express en Stripe.
+3. `POST /api/v1/technicians/me/payment-account/onboarding-link` devuelve el enlace. Ábrelo y usa los datos de prueba de Stripe: código SMS `000000`, y la CLABE de prueba que indique la documentación de Stripe para México (hoy `000000001234567897`).
+4. `POST /api/v1/technicians/me/payment-account/refresh` debe mostrar `ENABLED` con `can_receive_payments: true`. El webhook `account.updated` también lo actualiza solo.
+
+**5. Cliente: guardar una tarjeta**
+1. `POST /api/v1/clients/me/payment-methods/setup-intent` devuelve un `client_secret` que empieza con `seti_`.
+2. En la página de prueba, captura la tarjeta y envía.
+3. `GET /api/v1/clients/me/payment-methods` debe listar la tarjeta, con su `pm_…`.
+
+**6. Orden y cobro** (el camino feliz)
+
+| Paso | Llamada | Qué debes ver |
+|---|---|---|
+| Crear | `POST /orders` (cliente) | `REQUESTED` |
+| Aceptar | `POST /orders/{id}/accept` `{"agreed_price":"850.00"}` (técnico) | `ACCEPTED` |
+| Agendar | `POST /orders/{id}/schedule` con una hora **dentro de las próximas 3 h** (si es más tarde, "en camino" responde `ORDER_DEPART_TOO_EARLY`) | `SCHEDULED` |
+| Elegir tarjeta | `POST /orders/{id}/payment-method` `{"payment_method_id":"pm_…"}` con `Idempotency-Key` (cliente) | Pago `PENDING` |
+| En camino | `POST /orders/{id}/depart` (técnico) | `AUTHORIZED`. En Stripe: PaymentIntent `requires_capture` por $986.00 con `application_fee_amount` y destino, la cuenta del técnico |
+| Iniciar y terminar | `/start`, `/finish` | `IN_PROGRESS` y luego `AWAITING_APPROVAL` |
+| Aprobar | `POST /orders/{id}/approve` (cliente), o sin respuesta a las 72 h | `COMPLETED` |
+| Capturar | El worker `jobs` en ≤ 60 s | Pago `PAID`, orden `READY_FOR_REVIEW`. En Stripe: `succeeded`, transferencia al técnico y comisión en tu saldo |
+
+Revisa `GET /api/v1/admin/payments/{id}` (desglose, historial y asientos) y `GET /api/v1/admin/finance/summary`.
+
+**7. Casos que debes probar**
+
+| Caso | Cómo | Resultado esperado |
+|---|---|---|
+| 3D Secure fuera de sesión | Guarda `4000 0027 6000 3184` (pide autenticación siempre; complétala al guardarla) y sal a la orden | `depart` responde `REQUIRES_ACTION`. Con el `client_secret` (`pi_…`) de `GET /orders/{id}/payment` y el `pm_…` en la página, completa la autenticación. `POST /orders/{id}/payment/refresh`, o el webhook, deja el pago en `AUTHORIZED` |
+| Tarjeta que se guarda pero se rechaza | `4000 0000 0000 0341` | `depart` falla y la orden sigue `SCHEDULED`. El cliente recibe el aviso y elige otra tarjeta |
+| Reembolso | `POST /orders/{id}/refund-requests` (cliente), luego `POST /admin/refunds/{id}/approve` (finanzas) | `refund.updated` lo deja en `SUCCEEDED`. Asientos de devolución y transferencia revertida al técnico |
+| Doble firma | Reembolso de más de $2,000 | Queda `REQUESTED` hasta que lo aprueba `FINANCE_ADMIN` |
+| Contracargo | Paga con `4000 0000 0000 0259` | Llega `charge.dispute.created`, el pago pasa a `DISPUTED` y aparece una alerta. Envía evidencia con `POST /admin/disputes/{id}/evidence` y nota `winning_evidence` (gana) o `losing_evidence` (pierde y revierte al técnico) |
+| Cancelación con cargo | Configura una política `CLIENT_CANCEL_ON_SITE` (`POST /admin/cancellation-policies`) y cancela como cliente después de "en camino" | Captura parcial del cargo por visita (política ON_SITE) |
+| Webhook ajeno | `stripe trigger payment_intent.succeeded` | Se guarda y se ignora (no es un cobro nuestro) |
+| Webhook falso | `curl -X POST …/webhooks/stripe -H 'Stripe-Signature: t=1,v1=00'` | 400 y registro en el log de seguridad |
+| Conciliación | Cambia algo en el panel de Stripe, por ejemplo un reembolso manual | El trabajo `payments.reconcile` lo registra (`OUTSIDE_APP`) o lo alerta |
+
+**8. Antes de pasar a live:** revisa la lista de 17.6.
+
+### 17.4 Flujo completo del dinero
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant T as Técnico
+    participant API
+    participant W as Worker
+    participant S as Stripe
+    T->>API: KYC aprobado + cuenta Connect (onboarding)
+    S-->>API: account.updated → ENABLED (regla crítica: KYC APPROVED + cuenta ENABLED + sin bloqueo)
+    C->>API: guarda tarjeta (SetupIntent; la tarjeta nunca toca nuestro servidor)
+    C->>API: crea orden
+    T->>API: acepta con precio, agenda
+    C->>API: elige tarjeta (Idempotency-Key)
+    T->>API: en camino (≤ 3 h antes)
+    API->>S: PaymentIntent manual, off_session, destino = técnico, application_fee = comisión + IVA + retenciones
+    S-->>API: requires_capture → AUTHORIZED (o REQUIRES_ACTION → 3D Secure del cliente)
+    T->>API: inicia, termina
+    C->>API: aprueba (o 72 h sin respuesta, D5)
+    W->>S: captura (o 24 h antes de que venza, D4)
+    S-->>W: payment_intent.succeeded (firmado; el worker re-consulta)
+    W->>API: PAID + asientos (partida doble) → orden calificable
+    S-->>T: depósito (payout.*)
+    Note over API,S: Reembolsos (D8 doble firma), disputas de la orden, contracargos (D9) y conciliación diaria
+```
+
+| Momento | Estado del pago | Asientos del libro |
+|---|---|---|
+| Cotización (aceptar) | — | Desglose `QUOTE` congelado en `commission_transactions` |
+| En camino | `PENDING` → `AUTHORIZED` | Ninguno: aún no hay dinero |
+| Captura | `PAID` | Cliente −total; técnico +neto; plataforma +comisión; IVA de la comisión; retenciones |
+| Reembolso | `PARTIALLY_REFUNDED` / `REFUNDED` | Reverso según el motivo: quién absorbe (técnico, comisión, IVA, retenciones, plataforma) |
+| Contracargo perdido | `CHARGED_BACK` | Cliente; reversión al técnico (D9) o lo absorbe la plataforma |
+
+### 17.5 Pruebas
+
+`tests/test_payments_security.py` (19 pruebas, una o más por hallazgo):
+- reembolso durante un contracargo, perdido y ganado; reembolso bloqueado con un contracargo abierto;
+- D8 acumulado y en la resolución de disputas;
+- "en camino" temprano;
+- captura real distinta y conciliación de lo capturado;
+- límites que cuentan los intentos fallidos, cuota por usuario y purga;
+- 3D Secure contra rechazo, y anulación de una autorización tardía;
+- nombre con KYC suspendido;
+- el generador de `.env`.
+
+Total: **702 pruebas** contra PostgreSQL real.
+
+### 17.6 Pendientes antes de producción
+
+- [ ] **Contador:** tasas de retención ISR e IVA (con y sin RFC), CFDI de la comisión, tratamiento fiscal de reembolsos y contracargos.
+- [ ] **Abogado:** encuadre frente a la Ley Fintech (la plataforma no custodia fondos: los cargos van con destino a la cuenta del técnico), términos y condiciones, política de cancelación.
+- [ ] **Aviso de privacidad:** mencionar la transferencia de datos del técnico y del cliente a Stripe.
+- [ ] Correr la guía 17.3 completa con tus claves de prueba, incluidos 3D Secure y contracargo.
+- [ ] En Stripe live: dos endpoints de webhook (plataforma y Connect) con secretos distintos, clave restringida y branding de Connect.
+- [ ] Infraestructura: TLS con `deploy/nginx/nginx.conf`, S3 con KMS, gestor de secretos, respaldos de PostgreSQL, monitoreo de alertas de finanzas y de la bandeja de webhooks.
+- [ ] Frontend: guardado de tarjeta con Stripe.js o Payment Element, 3D Secure y el panel de finanzas.

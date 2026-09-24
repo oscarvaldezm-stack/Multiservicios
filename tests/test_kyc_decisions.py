@@ -308,7 +308,8 @@ def test_programador_de_trabajos_corre_todo(db):
     result = run_once()
     assert set(result) == {"kyc.release_stale_claims", "kyc.expire_approvals", "orders.auto_approve",
                            "orders.expire_requests", "payments.enforce_capture_deadline",
-                           "payments.capture_due", "payments.purge_idempotency_keys", "payments.process_webhooks",
+                           "payments.capture_due", "payments.purge_idempotency_keys", "payments.purge_rate_hits",
+                           "payments.process_webhooks",
                            "payments.retry_voids", "payments.reconcile", "payments.retry_refunds"}
     assert all(v == 0 for v in result.values())
 

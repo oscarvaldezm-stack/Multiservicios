@@ -56,7 +56,15 @@ from app.models import (
     User,
 )
 from app.payments import ledger
-from app.payments.commission import RuleTerms, TaxRates, compute, resolve_rule, to_cents
+from app.payments.commission import (
+    CommissionError,
+    RuleTerms,
+    TaxRates,
+    compute,
+    price_for_charge,
+    resolve_rule,
+    to_cents,
+)
 from app.payments.providers.base import AuthorizationRequest, PaymentProvider, ProviderError, ProviderPayment
 from app.payments.state_machine import (  # noqa: F401  (reexportados para el resto de la app)
     ALLOWED_PAYMENT_TRANSITIONS,
@@ -299,11 +307,38 @@ def apply_provider_state(db: Session, payment: Payment, pp: ProviderPayment) -> 
         mark_failed(db, payment, pp.failure_code or "provider_failed")
     elif target == P.CANCELLED and before in CANCELLABLE:
         _cancelled_by_provider(db, payment, before)
+    elif target in (P.AUTHORIZED, P.PAID) and before in (P.FAILED, P.CANCELLED):
+        _late_success_on_dead_payment(db, payment, pp)
+        return False
     else:
         log.info("Evento de pago ignorado: %s → %s (pago %s)", before.value, target.value, payment.id)
         return False
     db.flush()
     return True
+
+
+def _late_success_on_dead_payment(db: Session, payment: Payment, pp: ProviderPayment) -> None:
+    """
+    El cliente completó 3D Secure (o el banco aprobó) sobre un pago que ya dimos por muerto y que
+    tiene reemplazo: la reserva se libera (vía la cola de anulaciones, con reintentos) para no
+    retener dinero del cliente. Si ya se capturó, no se adivina: alerta a finanzas.
+    """
+    queued = db.scalar(select(OutboxEvent.id).where(OutboxEvent.aggregate_id == payment.id,
+                                                   OutboxEvent.event_type == "payment.void_requested",
+                                                   OutboxEvent.processed_at.is_(None)).limit(1))
+    if pp.status == P.AUTHORIZED and payment.provider_payment_id:
+        if queued is not None:
+            return
+        db.add(OutboxEvent(event_type="payment.void_requested", aggregate_type="payment", aggregate_id=payment.id,
+                           payload={"provider_payment_id": payment.provider_payment_id,
+                                    "reason": "late_authorization"}))
+    else:
+        db.add(OutboxEvent(event_type="payment.reconciliation_mismatch", aggregate_type="payment",
+                           aggregate_id=payment.id, payload={"kind": "CAPTURED_AFTER_FAILURE",
+                                                             "payment_id": str(payment.id),
+                                                             "ours": payment.status.value}))
+    log.warning("Pago %s en %s recibió %s del proveedor", payment.id, payment.status.value, pp.status.value)
+    db.flush()
 
 
 def _cancelled_by_provider(db: Session, payment: Payment, before: PaymentStatus) -> None:
@@ -395,6 +430,22 @@ def quote_terms(quote: CommissionTransaction) -> tuple[RuleTerms, TaxRates]:
     return terms, taxes
 
 
+def _add_capture_breakdown(db: Session, payment: Payment, b, taxes) -> CommissionTransaction:
+    t = b.terms
+    row = CommissionTransaction(
+        payment_id=payment.id, stage="CAPTURE", rule_id=t.rule_id, rule_scope=t.scope.value, rule_type=t.type.value,
+        rate_bp=t.rate_bp, fixed_cents=t.fixed_cents, min_cents=t.min_cents, max_cents=t.max_cents,
+        service_tax_bp=taxes.service_tax_bp, commission_tax_bp=taxes.commission_tax_bp,
+        isr_withholding_bp=taxes.isr_withholding_bp, iva_withholding_bp=taxes.iva_withholding_bp,
+        technician_has_rfc=taxes.technician_has_rfc, price_cents=b.price_cents, service_tax_cents=b.service_tax_cents,
+        gross_cents=b.gross_cents, discount_cents=b.discount_cents, commission_cents=b.commission_cents,
+        commission_tax_cents=b.commission_tax_cents, withholding_isr_cents=b.withholding_isr_cents,
+        withholding_iva_cents=b.withholding_iva_cents, technician_cents=b.technician_cents)
+    db.add(row)
+    db.flush()
+    return row
+
+
 def capture_partial(db: Session, payment: Payment, price_cents: int, *, terms: RuleTerms | None = None,
                     provider: PaymentProvider | None = None) -> Payment:
     """
@@ -409,17 +460,7 @@ def capture_partial(db: Session, payment: Payment, price_cents: int, *, terms: R
     b = compute(price_cents, terms or base_terms, taxes)
     if b.charge_cents >= payment.amount_cents:
         return capture(db, payment, provider)
-    t = b.terms
-    db.add(CommissionTransaction(
-        payment_id=payment.id, stage="CAPTURE", rule_id=t.rule_id, rule_scope=t.scope.value, rule_type=t.type.value,
-        rate_bp=t.rate_bp, fixed_cents=t.fixed_cents, min_cents=t.min_cents, max_cents=t.max_cents,
-        service_tax_bp=taxes.service_tax_bp, commission_tax_bp=taxes.commission_tax_bp,
-        isr_withholding_bp=taxes.isr_withholding_bp, iva_withholding_bp=taxes.iva_withholding_bp,
-        technician_has_rfc=taxes.technician_has_rfc, price_cents=b.price_cents, service_tax_cents=b.service_tax_cents,
-        gross_cents=b.gross_cents, discount_cents=b.discount_cents, commission_cents=b.commission_cents,
-        commission_tax_cents=b.commission_tax_cents, withholding_isr_cents=b.withholding_isr_cents,
-        withholding_iva_cents=b.withholding_iva_cents, technician_cents=b.technician_cents))
-    db.flush()
+    _add_capture_breakdown(db, payment, b, taxes)
     result = _provider(provider).capture(payment.provider_payment_id, payment.id, b.charge_cents,
                                          application_fee_cents=b.application_fee_cents)
     apply_provider_state(db, payment, result)
@@ -526,15 +567,43 @@ def mark_captured(db: Session, payment: Payment, captured_cents: int | None = No
     if not move(payment, P.PAID):
         return
     effective = effective_breakdown(db, payment)
+    expected = effective.gross_cents - effective.discount_cents
+    if captured_cents and captured_cents != expected:
+        effective = _breakdown_for_real_capture(db, payment, effective, captured_cents)
     payment.captured_cents = effective.gross_cents - effective.discount_cents
-    if captured_cents and captured_cents != payment.captured_cents:
-        log.error("Captura de %s centavos distinta al desglose (%s) en el pago %s", captured_cents,
-                  payment.captured_cents, payment.id)       # la conciliación lo alerta
     payment.captured_at = _now()
     db.flush()
     _record(db, payment, PaymentTransactionType.CAPTURE, "succeeded", amount_cents=payment.captured_cents)
     ledger.post_capture(db, payment, effective)
     orders.on_payment_captured(db, payment.service_order_id)
+
+
+def _breakdown_for_real_capture(db: Session, payment: Payment, effective, captured_cents: int):
+    """
+    El proveedor cobró otra cantidad que la de nuestro desglose: una captura parcial cuya respuesta
+    se perdió (timeout y rollback del desglose) o una captura hecha desde el panel del proveedor.
+    Lo que se asienta es lo que DE VERDAD se cobró: se recalcula el desglose sobre ese monto con la
+    regla y tasas de la cotización. Si ya había un desglose de captura distinto, no se adivina: se
+    alerta a finanzas y se deja el existente (la conciliación también lo marca).
+    """
+    quote = _breakdown(db, payment)
+    fixable = effective.stage == "QUOTE" and 0 < captured_cents < payment.amount_cents
+    b = None
+    if fixable:
+        terms, taxes = quote_terms(quote)
+        try:
+            b = compute(price_for_charge(captured_cents, quote.service_tax_bp), terms, taxes)
+        except CommissionError:
+            b = None
+    if b is None or b.charge_cents != captured_cents:
+        log.error("Captura de %s centavos distinta al desglose en el pago %s", captured_cents, payment.id)
+        db.add(OutboxEvent(event_type="payment.capture_amount_mismatch", aggregate_type="payment",
+                           aggregate_id=payment.id, payload={"provider_cents": captured_cents,
+                                                             "ours_cents": effective.gross_cents
+                                                             - effective.discount_cents}))
+        return effective
+    log.warning("Pago %s: se asienta la captura real de %s centavos (desglose recalculado)", payment.id, captured_cents)
+    return _add_capture_breakdown(db, payment, b, taxes)
 
 
 def mark_failed(db: Session, payment: Payment, failure_code: str) -> None:
@@ -592,7 +661,16 @@ def mark_dispute_closed(db: Session, payment: Payment, *, won: bool) -> None:
     if payment.status != P.DISPUTED:
         return
     if won:
-        move(payment, P.PARTIALLY_REFUNDED if payment.refunded_cents else P.PAID)
+        # Un reembolso pudo confirmarse durante la disputa (refunds._succeed): cuenta al cerrar.
+        if payment.refunded_cents >= payment.captured_cents > 0:
+            from app.core.actor import Actor
+            from app.orders import service as orders
+
+            move(payment, P.REFUNDED)
+            db.flush()
+            orders.on_full_refund(db, payment.service_order_id, Actor.system())
+        else:
+            move(payment, P.PARTIALLY_REFUNDED if payment.refunded_cents else P.PAID)
         db.flush()
         return
     from app.payments.disputes import charge_back

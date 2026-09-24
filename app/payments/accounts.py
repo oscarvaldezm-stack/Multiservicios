@@ -288,7 +288,12 @@ def resolve_name_review(db: Session, actor: Actor, account_id: uuid.UUID, *, app
     if account.blocked_reason != NAME_MISMATCH:
         raise PaymentAccountError("La cuenta no está en revisión de nombre", code="PAYMENT_ACCOUNT_NOT_IN_REVIEW")
     if approve:
-        account.blocked_reason = None
+        # block_for_kyc no pisa un NAME_MISMATCH: si el KYC se suspendió o venció mientras tanto,
+        # ese bloqueo estaba "escondido" detrás y ahora es el que queda (no se libera la cuenta).
+        profile = db.scalar(select(KycProfile).where(KycProfile.technician_id == account.technician_id))
+        kyc_block = {KycStatus.SUSPENDED: "KYC_SUSPENDED", KycStatus.EXPIRED: "KYC_EXPIRED"}.get(
+            profile.status if profile is not None else None)
+        account.blocked_reason = kyc_block
         account.name_matches_kyc = True
     else:
         account.blocked_reason = "NAME_REJECTED"

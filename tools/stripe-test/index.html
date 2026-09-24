@@ -1,0 +1,89 @@
+<!doctype html>
+<!--
+  SOLO PRUEBAS LOCALES (modo prueba de Stripe). Sustituye al frontend mientras no exista:
+    1. Guardar una tarjeta: pega la clave publicable (pk_test_) y el client_secret que devuelve
+       POST /api/v1/clients/me/payment-methods/setup-intent  (empieza con seti_).
+    2. Completar 3D Secure de un cobro: pega el client_secret de
+       GET /api/v1/orders/{id}/payment  cuando el estado es REQUIRES_ACTION  (empieza con pi_).
+  Sírvela en localhost (Stripe.js no corre desde file://):
+       python -m http.server 3000 --directory tools/stripe-test     →  http://localhost:3000
+  Nunca pongas aquí una clave secreta (sk_/rk_): la página la rechaza.
+-->
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prueba de tarjetas</title>
+  <script src="https://js.stripe.com/v3/"></script>
+  <style>
+    :root { --bg: #f6f7f9; --fg: #1d2330; --muted: #5b6475; --card: #fff; --line: #d8dde6; --accent: #4b5bdc; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #14171d; --fg: #e8ebf1; --muted: #9aa3b5; --card: #1d2129; --line: #323846; --accent: #8b97ff; }
+    }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+    main { max-width: 560px; margin: 32px auto; padding: 0 16px; }
+    section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 20px; }
+    label { display: block; margin: 14px 0 6px; font-weight: 600; }
+    input, #card { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid var(--line);
+                   border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
+    button { margin-top: 18px; padding: 10px 16px; border: 0; border-radius: 6px; background: var(--accent);
+             color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+    p.hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+    pre { white-space: pre-wrap; word-break: break-all; background: var(--bg); padding: 10px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Prueba de tarjetas (modo prueba)</h1>
+  <section>
+    <label for="pk">Clave publicable</label>
+    <input id="pk" placeholder="pk_test_…" autocomplete="off">
+    <label for="secret">client_secret</label>
+    <input id="secret" placeholder="seti_…_secret_…  o  pi_…_secret_…" autocomplete="off">
+    <p class="hint">seti_ guarda una tarjeta; pi_ completa la autenticación (3D Secure) de un cobro.</p>
+    <label for="pm">Tarjeta guardada (solo para pi_)</label>
+    <input id="pm" placeholder="pm_… (de GET /api/v1/clients/me/payment-methods)" autocomplete="off">
+    <p class="hint">Fuera de sesión, Stripe deja el cobro esperando que el cliente se autentique con la tarjeta que eligió.</p>
+    <label>Tarjeta (solo para seti_)</label>
+    <div id="card"></div>
+    <p class="hint">4242 4242 4242 4242 normal · 4000 0027 6000 3184 siempre pide 3D Secure ·
+      4000 0000 0000 0341 se guarda pero el cobro falla · cualquier fecha futura y CVC.</p>
+    <button id="go" type="button">Enviar a Stripe</button>
+    <pre id="out">—</pre>
+  </section>
+</main>
+<script>
+  let stripe = null, card = null;
+  const $ = (id) => document.getElementById(id);
+  const show = (obj) => { $("out").textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2); };
+
+  $("pk").addEventListener("change", () => {
+    const pk = $("pk").value.trim();
+    if (!pk.startsWith("pk_test_")) { show("Usa una clave publicable de MODO PRUEBA (pk_test_). Nunca una sk_/rk_."); return; }
+    stripe = Stripe(pk);
+    card = stripe.elements().create("card", { hidePostalCode: true });
+    $("card").innerHTML = "";
+    card.mount("#card");
+    show("Listo: pega el client_secret.");
+  });
+
+  $("go").addEventListener("click", async () => {
+    const secret = $("secret").value.trim();
+    if (!stripe) { show("Primero pega la clave publicable."); return; }
+    if (secret.startsWith("seti_")) {
+      const { setupIntent, error } = await stripe.confirmCardSetup(secret, { payment_method: { card } });
+      show(error ? { error: error.code, message: error.message }
+                 : { setupIntent: setupIntent.id, status: setupIntent.status, payment_method: setupIntent.payment_method });
+    } else if (secret.startsWith("pi_")) {
+      // El cobro ya tiene su tarjeta: solo se completa la autenticación que pidió el banco.
+      const pm = $("pm").value.trim();
+      const { paymentIntent, error } = await stripe.confirmCardPayment(secret, pm ? { payment_method: pm } : undefined);
+      show(error ? { error: error.code, message: error.message }
+                 : { paymentIntent: paymentIntent.id, status: paymentIntent.status });
+    } else {
+      show("El client_secret debe empezar con seti_ o pi_.");
+    }
+  });
+</script>
+</body>
+</html>

@@ -448,6 +448,22 @@ class IdempotencyKey(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class RateLimitHit(Base):
+    """
+    Un intento de un usuario en una ruta que llama al proveedor. Se guarda en una transacción
+    PROPIA, así que cuenta aunque la petición falle después (un pm_ inventado también gasta cuota
+    del proveedor). El trabajo de limpieza borra los de más de un día.
+    """
+
+    __tablename__ = "rate_limit_hits"
+    __table_args__ = (Index("ix_rate_limit_hits_user_action_created", "user_id", "action", "created_at"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class CancellationPolicy(Base):
     """Políticas comerciales de cancelación que edita el administrador; el código solo las aplica."""
 

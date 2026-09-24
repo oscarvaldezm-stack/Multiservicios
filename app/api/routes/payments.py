@@ -20,7 +20,7 @@ from app.core.actor import Actor
 from app.core.config import get_settings
 from app.kyc.permissions import Permission
 from app.models import TechnicianPaymentAccount, UserRole
-from app.payments import accounts, customers
+from app.payments import accounts, customers, panel
 from app.payments.providers import PaymentProvider, get_provider
 from app.schemas.payments import (
     CardSetupOut,
@@ -54,6 +54,7 @@ def _out(account: TechnicianPaymentAccount | None) -> PaymentAccountOut:
 @tech_router.post("", response_model=PaymentAccountOut, status_code=status.HTTP_201_CREATED,
                   summary="Crear mi cuenta de pagos (requiere KYC aprobado)")
 def create_payment_account(_: EmptyIn, tech: CurrentTechnician, db: DbSession, provider: Provider, ctx: ReqCtx):
+    panel.check_provider_rate(db, tech.id)
     account = accounts.create_account(db, tech, provider, ctx)
     db.commit()
     return _out(account)
@@ -67,6 +68,7 @@ def get_payment_account(tech: CurrentTechnician, db: DbSession, provider: Provid
 @tech_router.post("/onboarding-link", response_model=OnboardingLinkOut,
                   summary="Enlace de un solo uso al formulario del proveedor (CLABE y datos)")
 def create_onboarding_link(_: EmptyIn, tech: CurrentTechnician, db: DbSession, provider: Provider):
+    panel.check_provider_rate(db, tech.id)
     link = accounts.onboarding_link(db, tech, provider)
     return OnboardingLinkOut(url=link.url, expires_at=link.expires_at)
 
@@ -74,6 +76,7 @@ def create_onboarding_link(_: EmptyIn, tech: CurrentTechnician, db: DbSession, p
 @tech_router.post("/refresh", response_model=PaymentAccountOut,
                   summary="Volver a consultar mi cuenta en el proveedor (no recibe ningún estado)")
 def refresh_payment_account(_: EmptyIn, tech: CurrentTechnician, db: DbSession, provider: Provider, ctx: ReqCtx):
+    panel.check_provider_rate(db, tech.id)
     account = accounts.get_account(db, tech.id, provider.name, lock=True)
     if account is not None:
         accounts.sync_account(db, account, provider, ctx=ctx)
@@ -85,6 +88,7 @@ def refresh_payment_account(_: EmptyIn, tech: CurrentTechnician, db: DbSession, 
 @client_router.post("/setup-intent", response_model=CardSetupOut, status_code=status.HTTP_201_CREATED,
                     summary="Preparar el guardado de una tarjeta (la tarjeta va directo al proveedor)")
 def start_card_setup(_: EmptyIn, client: CurrentClient, db: DbSession, provider: Provider):
+    panel.check_provider_rate(db, client.id)
     info = customers.start_card_setup(db, client, provider)
     db.commit()
     return CardSetupOut(client_secret=info.client_secret, publishable_key=get_settings().STRIPE_PUBLISHABLE_KEY)
@@ -92,6 +96,7 @@ def start_card_setup(_: EmptyIn, client: CurrentClient, db: DbSession, provider:
 
 @client_router.get("", response_model=list[SavedCardOut], summary="Mis tarjetas guardadas")
 def list_cards(client: CurrentClient, db: DbSession, provider: Provider):
+    panel.check_provider_rate(db, client.id)
     return [SavedCardOut(id=c.provider_id, brand=c.brand, last4=c.last4, exp_month=c.exp_month,
                          exp_year=c.exp_year) for c in customers.saved_cards(db, client, provider)]
 

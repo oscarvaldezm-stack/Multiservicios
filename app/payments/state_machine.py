@@ -9,6 +9,8 @@ Además de lo que pide el doc, se admiten:
   REQUIRES_ACTION → PROCESSING / AUTHORIZED / FAILED / CANCELLED  (el cliente completa o abandona 3D Secure)
   AUTHORIZED → FAILED                                        (la captura falla)
   DISPUTED → PARTIALLY_REFUNDED                              (disputa ganada sobre un pago con reembolso parcial)
+  DISPUTED → REFUNDED                                        (disputa ganada; un reembolso en curso se confirmó
+                                                              durante ella y cubrió todo; migración 0010)
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ ALLOWED_PAYMENT_TRANSITIONS: frozenset[tuple[PaymentStatus, PaymentStatus]] = fr
     (P.PAID, P.PARTIALLY_REFUNDED), (P.PAID, P.REFUNDED), (P.PAID, P.DISPUTED),
     (P.PARTIALLY_REFUNDED, P.REFUNDED), (P.PARTIALLY_REFUNDED, P.DISPUTED),
     (P.DISPUTED, P.PAID), (P.DISPUTED, P.PARTIALLY_REFUNDED), (P.DISPUTED, P.CHARGED_BACK),
+    (P.DISPUTED, P.REFUNDED),
 })
 
 # Estados en los que todavía no hay dinero cobrado y la reserva se puede anular.

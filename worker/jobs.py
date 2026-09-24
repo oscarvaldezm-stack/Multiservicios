@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.kyc import decisions
 from app.orders import service as orders
-from app.payments import idempotency, reconciliation, refunds, webhooks
+from app.payments import idempotency, panel, reconciliation, refunds, webhooks
 from app.payments import service as payments
 from app.security import log_sanitizer
 
@@ -44,6 +44,7 @@ JOBS: dict[str, Callable[[Session], int]] = {
     "payments.enforce_capture_deadline": payments.enforce_capture_deadline,
     "payments.capture_due": payments.capture_due,
     "payments.purge_idempotency_keys": idempotency.purge_expired,
+    "payments.purge_rate_hits": panel.purge_rate_hits,
     "payments.retry_voids": webhooks.retry_voids,
     "payments.retry_refunds": refunds.retry_approved,
     "payments.reconcile": reconciliation.reconcile,
