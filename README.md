@@ -78,7 +78,8 @@ scripts/
 ├── create_admin.py      # Único camino para crear administradores
 ├── load_sepomex.py      # Carga el catálogo oficial de códigos postales
 ├── rotate_keys.py       # Estado, activación, re-envoltura, revocación y re-key de llaves
-└── dev_env.py           # Solo desarrollo: .env con secretos aleatorios (Docker)
+├── dev_env.py           # Solo desarrollo: .env con secretos aleatorios (Docker)
+└── seed_dev.py          # Solo desarrollo: usuarios de prueba (finanzas, KYC, cliente, técnico aprobado)
 worker/run.py            # Worker de antivirus y saneamiento (proceso aparte, sin acceso a Internet)
 worker/jobs.py           # Trabajos periódicos: casos abandonados, KYC vencidos, aprobación a 72 h, solicitudes viejas, captura de pagos, webhooks, conciliación
 deploy/nginx/nginx.conf  # TLS 1.2/1.3, HTTP→HTTPS, HSTS, límites por IP, logs sin tickets
@@ -86,7 +87,7 @@ deploy/nginx/nginx.docker.conf # Nginx del entorno local de docker compose (127.
 deploy/postgres/         # Usuario de la app con privilegios mínimos al crear la base en Docker
 Dockerfile, docker-compose.yml # Todo el entorno con un comando (sección 17.2)
 tools/stripe-test/       # Página local para guardar tarjetas y completar 3D Secure en modo prueba
-tests/                   # 702 pruebas contra PostgreSQL real (esquema creado con las migraciones)
+tests/                   # 706 pruebas contra PostgreSQL real (esquema creado con las migraciones)
 ```
 
 ## Arranque rápido
@@ -1151,7 +1152,7 @@ Un revisor aparte (sin haber escrito el código) revisó todo el módulo de pago
 python scripts/dev_env.py         # crea .env con secretos aleatorios distintos (no pisa uno existente; permisos 600)
 docker compose up -d --build      # PostgreSQL, migraciones, API, 2 workers, ClamAV y Nginx
 curl http://localhost:8080/health # {"status":"ok"}; documentación en http://localhost:8080/docs
-docker compose exec api python -m scripts.create_admin admin@tuempresa.com "Tu Nombre"
+docker compose exec api python -m scripts.seed_dev    # usuarios de prueba (finanzas, KYC, cliente, técnico aprobado)
 ```
 
 | Servicio | Qué hace | Red |
@@ -1218,8 +1219,16 @@ python -m http.server 3000 --directory tools/stripe-test    # http://localhost:3
 ```
 Pega tu `pk_test_` y el `client_secret` que te dé la API. Nunca pegues una clave secreta; la página la rechaza.
 
+**Usuarios de prueba:** `docker compose exec api python -m scripts.seed_dev` crea, con el correo verificado y una contraseña común que imprime al final:
+- `finanzas.admin@example.com` (FINANCE_ADMIN) y `finanzas.operador@example.com` (FINANCE_OPERATOR);
+- `kyc.revisor@example.com` y `kyc.supervisor@example.com`;
+- `cliente@example.com`;
+- `tecnico@example.com`, con KYC **APROBADO** (datos de identidad de ejemplo, sin documentos) y disponible en todas las categorías.
+
+Se puede correr varias veces; cada vez cambia la contraseña, salvo que pases `--password`. No crea la cuenta de Stripe del técnico, porque eso es lo que se prueba. Se niega a correr en producción. En `http://localhost:8080/docs`, con **Authorize**, entras con cualquiera de ellos (usuario = correo).
+
 **4. Técnico: cuenta para cobrar**
-1. Registra un técnico y lleva su KYC hasta `APPROVED` (sección 10).
+1. Entra como `tecnico@example.com`. Sin el script, tendrías que llevar su KYC hasta `APPROVED` por el flujo de la sección 10.
 2. `POST /api/v1/technicians/me/payment-account` crea la cuenta Express en Stripe.
 3. `POST /api/v1/technicians/me/payment-account/onboarding-link` devuelve el enlace. Ábrelo y usa los datos de prueba de Stripe: código SMS `000000`, y la CLABE de prueba que indique la documentación de Stripe para México (hoy `000000001234567897`).
 4. `POST /api/v1/technicians/me/payment-account/refresh` debe mostrar `ENABLED` con `can_receive_payments: true`. El webhook `account.updated` también lo actualiza solo.
@@ -1307,7 +1316,9 @@ sequenceDiagram
 - nombre con KYC suspendido;
 - el generador de `.env`.
 
-Total: **702 pruebas** contra PostgreSQL real.
+`tests/test_seed_dev.py` (4): usuarios y roles, técnico aprobado que ya puede dar de alta su cuenta de pagos, dos corridas seguidas, contraseña débil y negativa en producción.
+
+Total: **706 pruebas** contra PostgreSQL real.
 
 ### 17.6 Pendientes antes de producción
 
